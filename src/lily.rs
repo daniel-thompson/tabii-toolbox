@@ -52,25 +52,70 @@ pub fn generate(tab: &Tab) -> (String, Vec<String>) {
 
     let has_chords = tab.systems.iter().any(|system| !system.chords.is_empty());
     let key_map = tab.key.map(|key| key_spelling_map(key.fifths()));
+    let volta = volta_marks(tab, &mut warnings);
 
     out.push_str("\\score {\n");
     out.push_str("  <<\n");
     if has_chords {
         out.push_str("    \\new ChordNames \\chordmode {\n");
-        for line in chord_lines(tab) {
+        for line in chord_lines(tab, &volta) {
             out.push_str(&format!("      {line}\n"));
         }
         out.push_str("    }\n");
     }
     out.push_str("    \\new StaffGroup <<\n");
     for tab_mode in [false, true] {
-        write_staff(&mut out, tab, key_map.as_ref(), &mut warnings, tab_mode);
+        write_staff(
+            &mut out,
+            tab,
+            key_map.as_ref(),
+            &mut warnings,
+            tab_mode,
+            &volta,
+        );
     }
     out.push_str("    >>\n");
     out.push_str("  >>\n");
     out.push_str("  \\layout { }\n");
     out.push_str("}\n");
     (out, warnings)
+}
+
+/// Volta section boundaries, one `(starts, ends)` pair per bar of the
+/// whole tab: a `:|` closes the section that began at the last `|:` or,
+/// implicitly, just after the previous `:|` (or at the beginning).
+fn volta_marks(tab: &Tab, warnings: &mut Vec<String>) -> Vec<(bool, bool)> {
+    let mut marks: Vec<(bool, bool)> = Vec::new();
+    let mut section_start: Option<usize> = None;
+    let mut section_from = 0usize;
+    for system in &tab.systems {
+        for bar in &system.bars {
+            let idx = marks.len();
+            let (mut start, mut end) = (false, false);
+            if bar.repeat_start {
+                if section_start.is_some() {
+                    warnings.push("ignoring nested repeat start (|:)".to_string());
+                } else {
+                    section_start = Some(idx);
+                }
+            }
+            if bar.close == Barline::RepeatEnd {
+                let from = section_start.take().unwrap_or(section_from);
+                if from == idx {
+                    start = true;
+                } else {
+                    marks[from].0 = true;
+                }
+                end = true;
+                section_from = idx + 1;
+            }
+            marks.push((start, end));
+        }
+    }
+    if section_start.is_some() {
+        warnings.push("ignoring repeat start (|:) without an end".to_string());
+    }
+    marks
 }
 
 /// Write one staff of the score: the conventional `Staff` when `tab_mode` is
@@ -85,6 +130,7 @@ fn write_staff(
     key_map: Option<&SpellingMap>,
     warnings: &mut Vec<String>,
     tab_mode: bool,
+    volta: &[(bool, bool)],
 ) {
     let two_voice = tab.systems.iter().any(|system| {
         system
@@ -122,6 +168,7 @@ fn write_staff(
                 voice,
                 key_map,
                 tab_mode,
+                volta,
             };
             let lines = render_voice_piece(&piece, &mut state, warn);
             for line in lines {
@@ -143,6 +190,7 @@ fn write_staff(
             voice: Voice::Single,
             key_map,
             tab_mode,
+            volta,
         };
         let lines = render_voice_piece(&piece, &mut state, warn);
         for line in lines {
@@ -197,6 +245,8 @@ struct Piece<'a> {
     voice: Voice,
     key_map: Option<&'a SpellingMap>,
     tab_mode: bool,
+    /// One `(starts, ends)` pair per bar of the whole tab.
+    volta: &'a [(bool, bool)],
 }
 
 fn render_voice_piece(
@@ -215,6 +265,7 @@ fn render_voice_piece(
         let mode = if key.minor { "minor" } else { "major" };
         lines.push(format!("\\key {} \\{}", pitch_class_name(root), mode));
     }
+    let mut bar_offset = 0usize;
     for (si, system) in piece.tab.systems.iter().enumerate() {
         if piece.voice != Voice::Lower && state.last_sig != Some(system.time_sig) {
             lines.push(format!(
@@ -223,7 +274,10 @@ fn render_voice_piece(
             ));
             state.last_sig = Some(system.time_sig);
         }
-        lines.extend(render_voice_system(piece, system, si, state, warnings));
+        lines.extend(render_voice_system(
+            piece, system, si, bar_offset, state, warnings,
+        ));
+        bar_offset += system.bars.len();
     }
     lines
 }
@@ -232,6 +286,7 @@ fn render_voice_system(
     piece: &Piece,
     system: &System,
     system_index: usize,
+    bar_offset: usize,
     state: &mut VoiceState,
     warnings: &mut Vec<String>,
 ) -> Vec<String> {
@@ -269,6 +324,9 @@ fn render_voice_system(
     let mut lines: Vec<String> = Vec::new();
     let mut pos = 0usize;
     let mut bar = 0usize;
+    if piece.volta[bar_offset].0 {
+        tokens.push("\\repeat volta 2 {".to_string());
+    }
 
     for event in &events {
         // Tie marks must continue the immediately preceding event with no
@@ -307,9 +365,21 @@ fn render_voice_system(
                 push_tie(&mut tokens);
                 tie_pending = false;
             }
-            let suffix = bar_suffix(system, bar, n_bars, voice, system_index == last_system);
+            let mut suffix = bar_suffix(system, bar, n_bars, voice, system_index == last_system);
+            if piece.volta[bar_offset + bar].1 {
+                // The closing brace of a volta repeat draws the `:|`
+                // barline itself.
+                suffix = if suffix.is_empty() {
+                    "}".to_string()
+                } else {
+                    format!("}} {suffix}")
+                };
+            }
             flush_bar(&mut tokens, &mut lines, &suffix);
             bar += 1;
+            if bar < n_bars && piece.volta[bar_offset + bar].0 {
+                tokens.push("\\repeat volta 2 {".to_string());
+            }
         }
         if event.abs > pos {
             tokens.extend(filler(
@@ -403,9 +473,19 @@ fn render_voice_system(
             ));
         }
         pos = bar_end;
-        let suffix = bar_suffix(system, bar, n_bars, voice, system_index == last_system);
+        let mut suffix = bar_suffix(system, bar, n_bars, voice, system_index == last_system);
+        if piece.volta[bar_offset + bar].1 {
+            suffix = if suffix.is_empty() {
+                "}".to_string()
+            } else {
+                format!("}} {suffix}")
+            };
+        }
         flush_bar(&mut tokens, &mut lines, &suffix);
         bar += 1;
+        if bar < n_bars && piece.volta[bar_offset + bar].0 {
+            tokens.push("\\repeat volta 2 {".to_string());
+        }
     }
     lines
 }
@@ -616,7 +696,9 @@ fn bar_suffix(
     let mut suffix = String::new();
     if voice != Voice::Lower {
         match system.final_barline {
-            Barline::RepeatEnd => suffix.push_str("\\bar \":|\""),
+            // A repeat end is drawn by the closing brace of the volta
+            // repeat itself.
+            Barline::RepeatEnd => {}
             Barline::Double => suffix.push_str("\\bar \"||\""),
             Barline::Single => {}
         }
@@ -642,9 +724,10 @@ fn flush_bar(tokens: &mut Vec<String>, lines: &mut Vec<String>, suffix: &str) {
 }
 
 /// The chord symbol line for each system.
-fn chord_lines(tab: &Tab) -> Vec<String> {
+fn chord_lines(tab: &Tab, volta: &[(bool, bool)]) -> Vec<String> {
     let mut lines = Vec::new();
     let last_system = tab.systems.len() - 1;
+    let mut bar_offset = 0usize;
     for (si, system) in tab.systems.iter().enumerate() {
         let mut slots: Vec<(usize, &Chord)> = system
             .chords
@@ -663,6 +746,9 @@ fn chord_lines(tab: &Tab) -> Vec<String> {
                 0
             };
             let mut tokens: Vec<String> = Vec::new();
+            if volta[bar_offset].0 {
+                tokens.push("\\repeat volta 2 {".to_string());
+            }
             let mut pos = start;
             for (i, &(abs, chord)) in slots.iter().enumerate() {
                 if abs < start {
@@ -697,12 +783,16 @@ fn chord_lines(tab: &Tab) -> Vec<String> {
                     &note_durs(col_of(pos, bar_ref), end - pos, beat_cols, unit),
                 ));
             }
-            let suffix = if bar + 1 == system.bars.len() && si != last_system {
+            let mut suffix = if bar + 1 == system.bars.len() && si != last_system {
                 "\\break"
             } else {
                 ""
             };
+            if volta[bar_offset].1 {
+                suffix = if suffix.is_empty() { "}" } else { "} \\break" };
+            }
             flush_bar(&mut tokens, &mut lines, suffix);
+            bar_offset += 1;
         }
     }
     lines
@@ -710,7 +800,7 @@ fn chord_lines(tab: &Tab) -> Vec<String> {
 
 #[cfg(test)]
 mod tests {
-    use crate::parser::parse;
+    use crate::parser::{Barline, parse};
 
     use super::generate;
 
@@ -803,7 +893,15 @@ mod tests {
         assert!(lilypond.contains("c4 e4 e,4 e4 |"));
         // The tie over the barline at the end of the first system.
         assert!(lilypond.contains("c'4 b4 a8 b8~ b8 c'8~ |"));
-        assert!(lilypond.contains("c'1 | \\bar \":|\" \\break"));
+        // The first system is a repeated section: it opens with a volta at
+        // the first bar and the `:|` closes it, so the barline itself is
+        // drawn by the repeat and every context wraps the same bars.
+        assert!(lilypond.contains("\\repeat volta 2 { c2 a2:7 |"));
+        assert!(lilypond.contains("c'1 | } \\break"));
+        assert!(lilypond.contains("\\repeat volta 2 { g4 c'4 b8 c'8~ c'4 |"));
+        assert!(lilypond.contains("\\repeat volta 2 { c4 e4 c4 e4 |"));
+        assert!(lilypond.contains("\\repeat volta 2 { g4\\3 c'4\\2 b8\\2 c'8\\2~ c'4\\2 |"));
+        assert!(!lilypond.contains("\\bar \":|\""));
         // Bar 9 changes to A7 half way through, so the first-string F is
         // spelled F natural (the key's spelling) rather than E sharp; the
         // move to the chord's E natural then avoids an E sharp to E motion.
@@ -843,6 +941,39 @@ mod tests {
         assert!(lilypond.contains("f4 a4 g,4 d4 |"));
         assert!(lilypond.contains("<c'\\2 e'\\1>4 d'4\\2 <g\\3 c'\\2>8 d'8\\2~ d'8\\2 e'8\\1~ |"));
         assert!(lilypond.contains("f4\\4 a4\\3 g,4\\6 d4\\4 |"));
+    }
+
+    #[test]
+    fn repeat_lilypond() {
+        // The seventh README example: `|:` starts a repeated section and
+        // `:|` ends it; the volta draws the repeat barlines itself.
+        let tab = parse(
+            "\
+{signature:4/4}
+|:0-------0-------|0-------0-------:|
+|:----------------|----------------:|
+|:----------------|----------------:|
+|:----------------|----------------:|
+|:----------------|----------------:|
+|:----------------|----------------:|
+",
+        )
+        .unwrap();
+        assert!(tab.warnings.is_empty(), "warnings: {:?}", tab.warnings);
+        assert!(tab.systems[0].bars[0].repeat_start);
+        assert_eq!(tab.systems[0].bars[1].close, Barline::RepeatEnd);
+        let (lilypond, warnings) = generate(&tab);
+        assert!(warnings.is_empty(), "warnings: {warnings:?}");
+        assert_eq!(lilypond.matches("\\repeat volta 2 { e'2 e'2 |").count(), 1);
+        assert_eq!(lilypond.matches("e'2 e'2 | }").count(), 1);
+        assert_eq!(
+            lilypond
+                .matches("\\repeat volta 2 { e'2\\1 e'2\\1 |")
+                .count(),
+            1
+        );
+        assert_eq!(lilypond.matches("e'2\\1 e'2\\1 | }").count(), 1);
+        assert!(!lilypond.contains("\\bar"));
     }
 
     #[test]

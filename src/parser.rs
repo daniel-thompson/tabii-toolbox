@@ -9,6 +9,9 @@
 //! * a `#` preceded by whitespace starts a comment running to the end of
 //!   the line (except inside `{...}` directives), and a line starting with
 //!   `#` is a comment too; comments are ignored entirely,
+//! * `|:` in place of a barline starts a repeated section and `:|` ends
+//!   one; a `:|` without a matching `|:` repeats from the previous `:|`
+//!   (or from the beginning),
 //! * a system is six string lines, the top line being the high E string,
 //! * each bar is `|`/`!` followed by the bar content and closed by `|`, `:|`
 //!   (repeat) or `||` (double barline),
@@ -58,6 +61,10 @@ pub struct Bar {
     /// Music-time position of the bar's first column within its system:
     /// the sum of the widths of the preceding bars.
     pub start: usize,
+    /// The bar starts a repeated section (`|:`).
+    pub repeat_start: bool,
+    /// The barline closing the bar: `|`, `||` or `:|`.
+    pub close: Barline,
     /// The split in force at the start of the bar: an explicit `!` or the
     /// split carried over from the previous bar. `None` means no voice has
     /// ever been separated: all strings are one (treble) voice.
@@ -103,9 +110,16 @@ pub enum Barline {
     RepeatEnd,
 }
 
-/// One parsed tab line: per-bar voice markers, bar contents and the closing
-/// barline.
-type ParsedLine = (Vec<char>, Vec<String>, Barline);
+/// One bar of a parsed tab line.
+struct ParsedBar {
+    /// The leading barline: `!` marks a voice split for this bar.
+    marker: char,
+    /// The bar starts a repeated section (`|:`).
+    repeat_start: bool,
+    content: String,
+    /// The barline closing the bar.
+    close: Barline,
+}
 
 /// Parse a whole tab document.
 pub fn parse(input: &str) -> Result<Tab, String> {
@@ -245,38 +259,41 @@ impl Parser {
             );
             return;
         }
-        let parsed: Option<Vec<ParsedLine>> =
+        let parsed: Option<Vec<Vec<ParsedBar>>> =
             lines.iter().map(|(_, l)| parse_tab_line(l)).collect();
         let Some(parsed) = parsed else {
             self.warn(lineno, "malformed tab system; skipped");
             return;
         };
-        let n_bars = parsed[0].1.len();
+        let n_bars = parsed[0].len();
         // Bars may be any width (as long as it divides into the time
         // signature); each bar's width must however be the same on every
         // string line.
-        let widths: Vec<usize> = parsed[0].1.iter().map(String::len).collect();
+        let widths: Vec<usize> = parsed[0].iter().map(|bar| bar.content.len()).collect();
         let consistent = n_bars > 0
             && widths.iter().all(|&width| width > 0)
-            && parsed.iter().all(|(_, chunks, _)| {
-                chunks.len() == n_bars
-                    && chunks
+            && parsed.iter().all(|line| {
+                line.len() == n_bars
+                    && line
                         .iter()
                         .zip(&widths)
-                        .all(|(chunk, &width)| chunk.len() == width)
+                        .all(|(bar, &width)| bar.content.len() == width)
             });
         if !consistent {
             self.warn(lineno, "inconsistent bar widths in tab system; skipped");
             return;
         }
-        let final_barline = parsed[0].2;
-        if parsed.iter().any(|(_, _, b)| *b != final_barline) {
+        let final_barline = parsed[0].last().unwrap().close;
+        if parsed
+            .iter()
+            .any(|line| line.last().unwrap().close != final_barline)
+        {
             self.warn(lineno, "inconsistent closing barlines; using the first");
         }
         let mut bars = Vec::with_capacity(n_bars);
         let mut start = 0usize;
         for (b, &width) in widths.iter().enumerate() {
-            let bangs: Vec<usize> = (0..6).filter(|&s| parsed[s].0[b] == '!').collect();
+            let bangs: Vec<usize> = (0..6).filter(|&s| parsed[s][b].marker == '!').collect();
             if bangs.len() > 1 {
                 self.warn(lineno, "multiple voice markers in one bar; using the first");
             }
@@ -289,7 +306,7 @@ impl Parser {
             let mut strings = Vec::with_capacity(6);
             let mut split_changes: Vec<(usize, usize)> = Vec::new();
             for (string, line) in parsed.iter().enumerate() {
-                let events = self.parse_string_events(&line.1[b]);
+                let events = self.parse_string_events(&line[b].content);
                 // A `.` moves the voice split from its column onward; it is
                 // not a note position itself (it acts like a `-`).
                 let (splits, notes): (Vec<_>, Vec<_>) = events
@@ -306,6 +323,8 @@ impl Parser {
             bars.push(Bar {
                 width,
                 start,
+                repeat_start: parsed.iter().any(|line| line[b].repeat_start),
+                close: parsed[0][b].close,
                 voice_split,
                 split_changes,
                 strings,
@@ -612,42 +631,69 @@ fn is_chord_token(token: &str) -> bool {
     i == chars.len()
 }
 
-/// Split one tab line into per-bar voice markers, bar contents and the
-/// closing barline.
-fn parse_tab_line(line: &str) -> Option<(Vec<char>, Vec<String>, Barline)> {
+/// The barline token at `chars[i]`: its closing barline, the next bar's
+/// leading marker, whether that marker starts a repeat, and the token's
+/// length in characters.
+fn read_barline(chars: &[char], i: usize) -> (Barline, char, bool, usize) {
+    match chars[i] {
+        '|' => match chars.get(i + 1) {
+            Some(':') => (Barline::Single, '|', true, 2),
+            Some('|') => (Barline::Double, '|', false, 2),
+            _ => (Barline::Single, '|', false, 1),
+        },
+        '!' => (Barline::Single, '!', false, 1),
+        _ => (Barline::RepeatEnd, '|', false, 2), // `:|`
+    }
+}
+
+/// Split one tab line into its bars. Barlines are `|`, `!` (voice split),
+/// `|:` (repeat start), `:|` (repeat end) and `||` (double); a barline
+/// between two bars closes the first and marks the second.
+fn parse_tab_line(line: &str) -> Option<Vec<ParsedBar>> {
     let chars: Vec<char> = line.chars().collect();
-    match chars.first()? {
-        '|' | '!' => {}
+    // The leading barline: `|`, `!` or `|:`.
+    let (mut marker, mut repeat_start, mut i) = match chars.first()? {
+        '!' => ('!', false, 1),
+        '|' if chars.get(1) == Some(&':') => ('|', true, 2),
+        '|' => ('|', false, 1),
         _ => return None,
-    }
-    if chars.last() != Some(&'|') {
-        return None;
-    }
-    let mut end = chars.len() - 1;
-    let mut barline = Barline::Single;
-    if end >= 1 && chars[end - 1] == ':' {
-        barline = Barline::RepeatEnd;
-        end -= 1;
-    } else if end >= 1 && chars[end - 1] == '|' {
-        barline = Barline::Double;
-        end -= 1;
-    }
-    let mut markers = Vec::new();
-    let mut chunks = Vec::new();
-    let mut current = String::new();
-    for &c in &chars[..end] {
-        if c == '|' || c == '!' {
-            let first = markers.is_empty();
-            markers.push(c);
-            if !first {
-                chunks.push(std::mem::take(&mut current));
+    };
+    let mut bars = Vec::new();
+    let mut content = String::new();
+    loop {
+        match chars.get(i) {
+            None => return None, // the line must end with a closing barline
+            // A stray `:` that does not close a bar is bar content.
+            Some(':') if chars.get(i + 1) != Some(&'|') => {
+                content.push(':');
+                i += 1;
             }
-        } else {
-            current.push(c);
+            Some('|') | Some('!') | Some(':') => {
+                let (close, next_marker, next_repeat, len) = read_barline(&chars, i);
+                bars.push(ParsedBar {
+                    marker,
+                    repeat_start,
+                    content: std::mem::take(&mut content),
+                    close,
+                });
+                i += len;
+                if i == chars.len() {
+                    // The line must end with a plain closing barline, not
+                    // with a marker for a bar that does not exist here.
+                    if next_marker != '|' || next_repeat {
+                        return None;
+                    }
+                    return Some(bars);
+                }
+                marker = next_marker;
+                repeat_start = next_repeat;
+            }
+            Some(&c) => {
+                content.push(c);
+                i += 1;
+            }
         }
     }
-    chunks.push(current);
-    Some((markers, chunks, barline))
 }
 
 #[cfg(test)]
@@ -749,6 +795,35 @@ mod tests {
     }
 
     #[test]
+    fn trailing_comments() {
+        // A `#` preceded by whitespace starts a comment, except inside a
+        // `{...}` directive; chord sharps are unaffected.
+        let tab = parse(
+            "\
+{title:My #1 Hit} # the big one
+{signature:4/4}
+F#  C#7 # the verse
+|0---------------|
+|----------------|
+|----------------|
+|----------------|
+|----------------|
+|----------------|
+",
+        )
+        .unwrap();
+        assert!(tab.warnings.is_empty(), "warnings: {:?}", tab.warnings);
+        assert_eq!(tab.title.as_deref(), Some("My #1 Hit"));
+        assert_eq!(tab.systems.len(), 1);
+        assert_eq!(tab.systems[0].chords.len(), 2);
+        assert_eq!(
+            tab.systems[0].chords[0].chord.root,
+            Spelling { letter: 3, acc: 1 }
+        );
+        assert_eq!(tab.systems[0].chords[1].chord.qual, Qual::Seven);
+    }
+
+    #[test]
     fn comments_are_ignored() {
         // Comments may appear anywhere, even between the lines of a system,
         // and are ignored entirely.
@@ -790,9 +865,9 @@ mod tests {
 
     #[test]
     fn readme_md_itself_parses() {
-        // All six fenced examples inside README.md should be found.
+        // All seven fenced examples inside README.md should be found.
         let tab = parse(include_str!("../README.md")).unwrap();
-        assert_eq!(tab.systems.len(), 6);
+        assert_eq!(tab.systems.len(), 7);
         // The first example shows the same music in bars of four different
         // widths.
         assert_eq!(tab.systems[0].bars.len(), 4);
@@ -888,6 +963,12 @@ mod tests {
                 arpeggio: true
             }]
         );
+        // The seventh example is a repeated section: `|:` starts it and
+        // `:|` ends it.
+        assert_eq!(tab.systems[6].bars.len(), 2);
+        assert!(tab.systems[6].bars[0].repeat_start);
+        assert_eq!(tab.systems[6].bars[1].close, Barline::RepeatEnd);
+        assert_eq!(tab.systems[6].bars[0].voice_split, Some(5));
     }
 
     #[test]
@@ -913,6 +994,11 @@ mod tests {
         assert_eq!(tab.systems[0].final_barline, Barline::RepeatEnd);
         assert_eq!(tab.systems[1].final_barline, Barline::Single);
         assert_eq!(tab.systems[2].final_barline, Barline::Double);
+        // The `:|` closing the first system ends a repeated section; there
+        // is no explicit `|:`, so the section reaches back to the start.
+        assert_eq!(tab.systems[0].bars[3].close, Barline::RepeatEnd);
+        assert!(!tab.systems[0].bars[0].repeat_start);
+        assert_eq!(tab.systems[0].bars[0].close, Barline::Single);
 
         // First system, first bar (C major): treble on the top three strings.
         let bar = &tab.systems[0].bars[0];

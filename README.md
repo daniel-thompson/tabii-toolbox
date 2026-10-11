@@ -15,8 +15,11 @@ Basics
 Bars are marked with `|` characters, strings with a `-` and numerals for fret
 numbers. Horizontal spacing marks the timing of each note and can be any number
 of characters wide (providing it can divide nicely into the time signature).
-Lines whose first character is `#` are comments; they are ignored entirely and
-can appear anywhere, even between the lines of a system.
+A `#` preceded by whitespace starts a comment that runs to the end of the
+line, and a line starting with `#` is a comment too. Comments are ignored
+entirely and can appear anywhere, even between the lines of a system. A `#`
+inside a `{...}` directive does not start a comment, so values such as
+`{title:My #1 Hit}` are safe.
 
 This example shows four identical bars with different widths.
 
@@ -125,6 +128,23 @@ which only labels the fret. Arpeggiated notes are engraved with an arpeggio
 
 Here the chord starts on the first column even though the fret numbers sit
 in the second, so it is engraved as a whole note with an arpeggio.
+
+Repeats
+-------
+
+A `|:` in place of a barline starts a repeated section and a `:|` ends one;
+a `:|` without a matching `|:` repeats from the previous `:|` (or from the
+beginning). The section is engraved as a volta repeat and played twice:
+
+~~~tab
+{signature:4/4}
+|:0-------0-------|0-------0-------:|
+|:----------------|----------------:|
+|:----------------|----------------:|
+|:----------------|----------------:|
+|:----------------|----------------:|
+|:----------------|----------------:|
+~~~
 
  
 ## Usage
