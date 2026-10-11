@@ -255,6 +255,13 @@ fn render_voice_piece(
     warnings: &mut Vec<String>,
 ) -> Vec<String> {
     let mut lines = Vec::new();
+    // The tempo mark is printed once, above the conventional staff.
+    if piece.voice != Voice::Lower
+        && !piece.tab_mode
+        && let Some(tempo) = piece.tab.tempo
+    {
+        lines.push(format!("\\tempo 4 = {tempo}"));
+    }
     if piece.voice != Voice::Lower
         && let Some(key) = piece.tab.key
     {
@@ -941,6 +948,45 @@ mod tests {
         assert!(lilypond.contains("f4 a4 g,4 d4 |"));
         assert!(lilypond.contains("<c'\\2 e'\\1>4 d'4\\2 <g\\3 c'\\2>8 d'8\\2~ d'8\\2 e'8\\1~ |"));
         assert!(lilypond.contains("f4\\4 a4\\3 g,4\\6 d4\\4 |"));
+    }
+
+    #[test]
+    fn double_digit_lilypond() {
+        // The second README example: double digit frets, each note starting
+        // at the first digit and taking two columns.
+        let tab = parse(
+            "\
+|--------|
+|------11|
+|----10--|
+|--11----|
+|12------|
+|--------|
+",
+        )
+        .unwrap();
+        let (lilypond, warnings) = generate(&tab);
+        assert!(warnings.is_empty(), "warnings: {warnings:?}");
+        assert!(lilypond.contains("a4 cis'4 f'4 ais'4 |"));
+        assert!(lilypond.contains("a4\\5 cis'4\\4 f'4\\3 ais'4\\2 |"));
+    }
+
+    #[test]
+    fn suicide_is_painless_lilypond() {
+        let tab = parse(include_str!("../examples/suicide_is_painless.tab")).unwrap();
+        let (lilypond, warnings) = generate(&tab);
+        assert!(warnings.is_empty(), "warnings: {warnings:?}");
+        assert!(lilypond.contains("\\tempo 4 = 110"));
+        // The `|:` before the second bar opens the repeated section that
+        // the `:|` in the last system closes; the staff and the tab staff
+        // repeat together (the file has no chord names).
+        assert_eq!(lilypond.matches("\\repeat volta 2 {").count(), 2);
+        // Bar 15 ends with the double digit fret 10.
+        assert!(lilypond.contains("<d a c' f'>4 g'8 a'8 a,8 a'8 c''8 d''8 |"));
+        assert!(
+            lilypond
+                .contains("<d\\4 a\\3 c'\\2 f'\\1>4 g'8\\1 a'8\\1 a,8\\5 a'8\\1 c''8\\1 d''8\\1 |")
+        );
     }
 
     #[test]

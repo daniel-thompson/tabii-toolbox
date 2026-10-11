@@ -32,6 +32,8 @@ pub struct Tab {
     pub composer: Option<String>,
     pub arranger: Option<String>,
     pub key: Option<Key>,
+    /// Beats per minute (quarter notes), from a `{tempo:N}` directive.
+    pub tempo: Option<u32>,
     pub tuning: Tuning,
     pub systems: Vec<System>,
     pub warnings: Vec<String>,
@@ -129,6 +131,7 @@ pub fn parse(input: &str) -> Result<Tab, String> {
             composer: None,
             arranger: None,
             key: None,
+            tempo: None,
             tuning: Tuning::standard(),
             systems: Vec::new(),
             warnings: Vec::new(),
@@ -226,6 +229,10 @@ impl Parser {
                     self.tab.key = Some(k);
                 }
                 None => self.warn(lineno, format!("ignoring malformed key {value:?}")),
+            },
+            "tempo" => match value.parse::<u32>() {
+                Ok(bpm) if bpm > 0 => self.tab.tempo = Some(bpm),
+                _ => self.warn(lineno, format!("ignoring malformed tempo {value:?}")),
             },
             "tuning" => {
                 if !value.eq_ignore_ascii_case("standard") {
@@ -347,37 +354,61 @@ impl Parser {
         // A `~` before a fret number marks an arpeggiated note that starts
         // on the `~`'s column rather than the number's.
         let mut arpeggio: Option<usize> = None;
-        for (i, ch) in chunk.chars().enumerate() {
+        let chars: Vec<char> = chunk.chars().collect();
+        let mut i = 0usize;
+        while i < chars.len() {
             let col = i + 1;
-            match ch {
+            match chars[i] {
                 '0'..='9' => {
+                    // Consecutive digits join into one (possibly double
+                    // digit) fret number; the note starts at the first
+                    // digit and the number takes one column per digit.
+                    let start = i;
+                    let mut fret: u32 = (chars[i] as u8 - b'0') as u32;
+                    i += 1;
+                    while i < chars.len() && chars[i].is_ascii_digit() {
+                        fret = fret
+                            .saturating_mul(10)
+                            .saturating_add((chars[i] as u8 - b'0') as u32);
+                        i += 1;
+                    }
                     let (onset, arpeggiated) = match arpeggio.take() {
-                        Some(start) => (start, true),
-                        None => (col, false),
+                        Some(start_col) => (start_col, true),
+                        None => (start + 1, false),
                     };
                     events.push(StringEvent::Onset {
                         col: onset,
-                        fret: ch as u8 - b'0',
+                        fret: u8::try_from(fret).unwrap_or(u8::MAX),
                         arpeggio: arpeggiated,
                     });
                 }
-                '-' | ' ' => self.drop_arpeggio(&mut arpeggio),
+                '-' | ' ' => {
+                    self.drop_arpeggio(&mut arpeggio);
+                    i += 1;
+                }
                 '^' => {
                     self.drop_arpeggio(&mut arpeggio);
                     events.push(StringEvent::Tie { col });
+                    i += 1;
                 }
                 '.' => {
                     self.drop_arpeggio(&mut arpeggio);
                     events.push(StringEvent::Split { col });
+                    i += 1;
                 }
-                '~' => arpeggio = Some(col),
+                '~' => {
+                    arpeggio = Some(col);
+                    i += 1;
+                }
                 _ => {
                     self.drop_arpeggio(&mut arpeggio);
-                    if self.unknown_chars.insert(ch) {
+                    if self.unknown_chars.insert(chars[i]) {
                         self.tab.warnings.push(format!(
-                            "ignoring unsupported character {ch:?} in tab (treated as a gap)"
+                            "ignoring unsupported character {:?} in tab (treated as a gap)",
+                            chars[i]
                         ));
                     }
+                    i += 1;
                 }
             }
         }
@@ -824,6 +855,113 @@ F#  C#7 # the verse
     }
 
     #[test]
+    fn double_digit_frets() {
+        // The second README example: consecutive digits join into one fret
+        // number whose note starts at the first digit, so each note takes
+        // two columns.
+        let tab = parse(
+            "\
+|--------|
+|------11|
+|----10--|
+|--11----|
+|12------|
+|--------|
+",
+        )
+        .unwrap();
+        assert!(tab.warnings.is_empty(), "warnings: {:?}", tab.warnings);
+        assert_eq!(tab.systems.len(), 1);
+        let bar = &tab.systems[0].bars[0];
+        assert_eq!(bar.width, 8);
+        assert_eq!(
+            bar.strings[1],
+            vec![StringEvent::Onset {
+                col: 7,
+                fret: 11,
+                arpeggio: false
+            }]
+        );
+        assert_eq!(
+            bar.strings[2],
+            vec![StringEvent::Onset {
+                col: 5,
+                fret: 10,
+                arpeggio: false
+            }]
+        );
+        assert_eq!(
+            bar.strings[3],
+            vec![StringEvent::Onset {
+                col: 3,
+                fret: 11,
+                arpeggio: false
+            }]
+        );
+        assert_eq!(
+            bar.strings[4],
+            vec![StringEvent::Onset {
+                col: 1,
+                fret: 12,
+                arpeggio: false
+            }]
+        );
+    }
+
+    #[test]
+    fn suicide_is_painless() {
+        let tab = parse(include_str!("../examples/suicide_is_painless.tab")).unwrap();
+        assert!(tab.warnings.is_empty(), "warnings: {:?}", tab.warnings);
+        assert_eq!(
+            tab.title.as_deref(),
+            Some("Song from M*A*S*H (Suicide Is Painless)")
+        );
+        assert_eq!(tab.tempo, Some(110));
+        assert_eq!(tab.systems.len(), 5);
+        // The `|:` before the second bar opens a section that the `:|` in
+        // the last system closes.
+        assert!(tab.systems[0].bars[1].repeat_start);
+        assert_eq!(tab.systems[4].bars[0].close, Barline::RepeatEnd);
+        // Bar 15 ends with the double digit fret 10, which starts at the
+        // first digit and sounds until the barline.
+        assert_eq!(
+            tab.systems[3].bars[2].strings[0],
+            vec![
+                StringEvent::Onset {
+                    col: 1,
+                    fret: 1,
+                    arpeggio: false
+                },
+                StringEvent::Onset {
+                    col: 5,
+                    fret: 3,
+                    arpeggio: false
+                },
+                StringEvent::Onset {
+                    col: 7,
+                    fret: 5,
+                    arpeggio: false
+                },
+                StringEvent::Onset {
+                    col: 11,
+                    fret: 5,
+                    arpeggio: false
+                },
+                StringEvent::Onset {
+                    col: 13,
+                    fret: 8,
+                    arpeggio: false
+                },
+                StringEvent::Onset {
+                    col: 15,
+                    fret: 10,
+                    arpeggio: false
+                },
+            ]
+        );
+    }
+
+    #[test]
     fn comments_are_ignored() {
         // Comments may appear anywhere, even between the lines of a system,
         // and are ignored entirely.
@@ -865,9 +1003,9 @@ F#  C#7 # the verse
 
     #[test]
     fn readme_md_itself_parses() {
-        // All seven fenced examples inside README.md should be found.
+        // All eight fenced examples inside README.md should be found.
         let tab = parse(include_str!("../README.md")).unwrap();
-        assert_eq!(tab.systems.len(), 7);
+        assert_eq!(tab.systems.len(), 8);
         // The first example shows the same music in bars of four different
         // widths.
         assert_eq!(tab.systems[0].bars.len(), 4);
@@ -899,12 +1037,24 @@ F#  C#7 # the verse
                 arpeggio: false
             }]
         );
+        // The second example joins consecutive digits into double digit
+        // fret numbers, each note starting at the first digit.
         assert_eq!(tab.systems[1].bars.len(), 1);
-        assert_eq!(tab.systems[1].time_sig, TimeSig { num: 4, den: 4 });
-        // The third example splits at the third string and moves the split
-        // to the fourth string with a `.` in the eighth column.
+        assert_eq!(tab.systems[1].bars[0].width, 8);
+        assert_eq!(
+            tab.systems[1].bars[0].strings[2],
+            vec![StringEvent::Onset {
+                col: 5,
+                fret: 10,
+                arpeggio: false
+            }]
+        );
         assert_eq!(tab.systems[2].bars.len(), 1);
-        let bar = &tab.systems[2].bars[0];
+        assert_eq!(tab.systems[2].time_sig, TimeSig { num: 4, den: 4 });
+        // The fourth example splits at the third string and moves the split
+        // to the fourth string with a `.` in the eighth column.
+        assert_eq!(tab.systems[3].bars.len(), 1);
+        let bar = &tab.systems[3].bars[0];
         assert_eq!(bar.voice_split, Some(2));
         assert_eq!(bar.split_changes, vec![(8, 3)]);
         assert_eq!(
@@ -922,53 +1072,37 @@ F#  C#7 # the verse
                 },
             ]
         );
-        // The fourth example has no metadata (defaulting to 4/4) and no
+        // The fifth example has no metadata (defaulting to 4/4) and no
         // marker on its second bar, which keeps the first bar's split.
-        assert_eq!(tab.systems[3].bars.len(), 2);
-        assert_eq!(tab.systems[3].time_sig, TimeSig { num: 4, den: 4 });
-        assert_eq!(tab.systems[3].bars[0].voice_split, Some(2));
-        assert_eq!(tab.systems[3].bars[1].voice_split, Some(2));
-        // The fifth example marks its second bar single voice with a `!` on
-        // the bottom string.
         assert_eq!(tab.systems[4].bars.len(), 2);
+        assert_eq!(tab.systems[4].time_sig, TimeSig { num: 4, den: 4 });
         assert_eq!(tab.systems[4].bars[0].voice_split, Some(2));
-        assert_eq!(tab.systems[4].bars[1].voice_split, Some(5));
-        // The sixth example marks an arpeggiated chord: every note starts on
-        // the `~` in the first column, not on the fret number next to it. It
-        // has no marker of its own, so it keeps the single-voice split (`!`
-        // on the bottom string) from the fifth example.
-        assert_eq!(tab.systems[5].bars.len(), 1);
-        assert_eq!(tab.systems[5].bars[0].voice_split, Some(5));
+        assert_eq!(tab.systems[4].bars[1].voice_split, Some(2));
+        // The sixth example marks its second bar single voice with a `!` on
+        // the bottom string.
+        assert_eq!(tab.systems[5].bars.len(), 2);
+        assert_eq!(tab.systems[5].bars[0].voice_split, Some(2));
+        assert_eq!(tab.systems[5].bars[1].voice_split, Some(5));
+        // The seventh example marks an arpeggiated chord: every note starts
+        // on the `~` in the first column, not on the fret number next to
+        // it. It has no marker of its own, so it keeps the single-voice
+        // split (`!` on the bottom string) from the sixth example.
+        assert_eq!(tab.systems[6].bars.len(), 1);
+        assert_eq!(tab.systems[6].bars[0].voice_split, Some(5));
         assert_eq!(
-            tab.systems[5].bars[0].strings[0],
+            tab.systems[6].bars[0].strings[0],
             vec![StringEvent::Onset {
                 col: 1,
                 fret: 0,
                 arpeggio: true
             }]
         );
-        assert_eq!(
-            tab.systems[5].bars[0].strings[1],
-            vec![StringEvent::Onset {
-                col: 1,
-                fret: 1,
-                arpeggio: true
-            }]
-        );
-        assert_eq!(
-            tab.systems[5].bars[0].strings[2],
-            vec![StringEvent::Onset {
-                col: 1,
-                fret: 2,
-                arpeggio: true
-            }]
-        );
-        // The seventh example is a repeated section: `|:` starts it and
-        // `:|` ends it.
-        assert_eq!(tab.systems[6].bars.len(), 2);
-        assert!(tab.systems[6].bars[0].repeat_start);
-        assert_eq!(tab.systems[6].bars[1].close, Barline::RepeatEnd);
-        assert_eq!(tab.systems[6].bars[0].voice_split, Some(5));
+        // The eighth example is a repeated section: `|:` starts it and `:|`
+        // ends it.
+        assert_eq!(tab.systems[7].bars.len(), 2);
+        assert!(tab.systems[7].bars[0].repeat_start);
+        assert_eq!(tab.systems[7].bars[1].close, Barline::RepeatEnd);
+        assert_eq!(tab.systems[7].bars[0].voice_split, Some(5));
     }
 
     #[test]

@@ -36,13 +36,27 @@ This example shows four identical bars with different widths.
 Each bar holds the same four crotchets; the wider the bar, the more
 characters each crotchet takes.
 
+Numeric figures join together to form a double digit fret number. Thus the
+following example shows a bar consisting of four crotchets, each taking two
+characters of width.
+
+~~~tab
+|--------|
+|------11|
+|----10--|
+|--11----|
+|12------|
+|--------|
+~~~
+
+
 Header
 ------
 
 Metadata is written as ChordPro-style `{key:value}` directives before the tab
 systems, and no separator is needed between the header and the music. The
 recognised keys are `title`, `composer`, `arranger`, `key`, `signature`
-(shorthand `s`) and `tuning`.
+(shorthand `s`), `tempo` (beats per minute) and `tuning`.
 
 
 
