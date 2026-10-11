@@ -32,6 +32,17 @@ impl Rational {
     pub fn is_positive(self) -> bool {
         self.num > 0
     }
+
+    /// Whether the value is a whole number.
+    pub fn is_integer(self) -> bool {
+        self.den == 1
+    }
+
+    /// The value times `scale`, rounded to the nearest integer (half up).
+    pub fn round_scaled(self, scale: i64) -> i64 {
+        let n = self.num * scale;
+        (n + self.den / 2) / self.den
+    }
 }
 
 fn gcd(mut a: i64, mut b: i64) -> i64 {
@@ -168,22 +179,40 @@ impl Tuning {
     }
 }
 
-/// A notated duration: LilyPond base length with optional augmentation dots.
+/// A notated duration: LilyPond base length with optional augmentation dots,
+/// optionally scaled as a member of a tuplet.  `tuplet` holds the `n/d` of
+/// `\tuplet n/d` (n notes in the time of d), which sounds each note for its
+/// written value times `d/n` — so a triplet crotchet is a crotchet with
+/// `tuplet: Some((3, 2))`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Dur {
     pub base: u32,
     pub dots: u32,
+    pub tuplet: Option<(u32, u32)>,
 }
 
 impl Dur {
+    /// A plain (non-tuplet) duration.
+    pub fn new(base: u32, dots: u32) -> Self {
+        Dur {
+            base,
+            dots,
+            tuplet: None,
+        }
+    }
+
     /// Length in quarter notes.
     pub fn len(self) -> Rational {
         let base = Rational::new(4, self.base as i64);
-        match self.dots {
+        let mut len = match self.dots {
             0 => base,
             1 => base * Rational::new(3, 2),
             _ => base * Rational::new(7, 4),
+        };
+        if let Some((num, den)) = self.tuplet {
+            len = len * Rational::new(den as i64, num as i64);
         }
+        len
     }
 
     pub fn to_lily(self) -> String {
@@ -197,17 +226,34 @@ impl Dur {
 
 const BASES: [u32; 8] = [1, 2, 4, 8, 16, 32, 64, 128];
 
+/// The tuplet ratios the grid can produce, as `\tuplet n/d`.  Only triplets
+/// for now; a wider ternary grid (24 columns per 4/4 bar) makes triplet
+/// semiquavers through triplet minims expressible.
+const TUPLETS: [(u32, u32); 1] = [(3, 2)];
+
 /// The single notated duration (at most one dot) equal to `len`, if any.
 pub fn single_dur(len: Rational) -> Option<Dur> {
     for base in BASES {
         for dots in 0..=1 {
-            let dur = Dur { base, dots };
+            let dur = Dur::new(base, dots);
             if dur.len() == len {
                 return Some(dur);
             }
         }
     }
     None
+}
+
+/// The single tuplet duration (at most one dot) equal to `len`, if any.
+pub fn single_tuplet_dur(len: Rational) -> Option<Dur> {
+    TUPLETS.iter().find_map(|&(num, den)| {
+        // Inside \tuplet n/d a note of binary length b sounds for b * d/n,
+        // so the written length is len * n/d.
+        single_dur(len * Rational::new(num as i64, den as i64)).map(|dur| Dur {
+            tuplet: Some((num, den)),
+            ..dur
+        })
+    })
 }
 
 /// Decompose `len` into a sequence of tied base durations, largest first.
@@ -221,7 +267,7 @@ pub fn split_dur(len: Rational) -> Vec<Dur> {
             .find(|&base| Rational::new(4, base as i64) <= rem)
         {
             Some(base) => {
-                parts.push(Dur { base, dots: 0 });
+                parts.push(Dur::new(base, 0));
                 rem = rem - Rational::new(4, base as i64);
             }
             None => break, // remainder finer than a 128th; the grid was warned about
@@ -234,14 +280,23 @@ pub fn split_dur(len: Rational) -> Vec<Dur> {
 /// `start_col` (1-based within the bar).
 ///
 /// A note that begins on a beat and matches a single (possibly dotted)
-/// duration is written as one note.  Anything else is split at the beat
-/// boundaries it crosses and written as tied notes; this is what turns the
-/// off-beat crotchets in the README example into pairs of tied quavers.
+/// duration is written as one note.  A note whose length is a single tuplet
+/// duration (a triplet crotchet on a 24 column grid, say) is written as one
+/// tuplet note: tuplets follow their own pulse, so they are not split at the
+/// binary beat boundaries even when one falls inside them.  Anything else is
+/// split at the beat boundaries it crosses and written as tied notes; this
+/// is what turns the off-beat crotchets in the README example into pairs of
+/// tied quavers.
 pub fn note_durs(start_col: usize, dur_cols: usize, beat_cols: usize, unit: Rational) -> Vec<Dur> {
     let len = unit * Rational::integer(dur_cols as i64);
     if beat_cols > 0
         && (start_col - 1).is_multiple_of(beat_cols)
         && let Some(dur) = single_dur(len)
+    {
+        return vec![dur];
+    }
+    if single_dur(len).is_none()
+        && let Some(dur) = single_tuplet_dur(len)
     {
         return vec![dur];
     }
@@ -260,7 +315,7 @@ pub fn note_durs(start_col: usize, dur_cols: usize, beat_cols: usize, unit: Rati
     let mut durs = Vec::new();
     for seg in segs {
         let seg_len = unit * Rational::integer(seg as i64);
-        match single_dur(seg_len) {
+        match single_dur(seg_len).or_else(|| single_tuplet_dur(seg_len)) {
             Some(dur) => durs.push(dur),
             None => durs.extend(split_dur(seg_len)),
         }
@@ -572,28 +627,89 @@ mod tests {
 
     #[test]
     fn single_and_split_durations() {
-        assert_eq!(single_dur(r(4, 1)), Some(Dur { base: 1, dots: 0 }));
-        assert_eq!(single_dur(r(2, 1)), Some(Dur { base: 2, dots: 0 }));
-        assert_eq!(single_dur(r(1, 1)), Some(Dur { base: 4, dots: 0 }));
-        assert_eq!(single_dur(r(1, 2)), Some(Dur { base: 8, dots: 0 }));
-        assert_eq!(single_dur(r(1, 4)), Some(Dur { base: 16, dots: 0 }));
-        assert_eq!(single_dur(r(3, 4)), Some(Dur { base: 8, dots: 1 }));
-        assert_eq!(single_dur(r(3, 2)), Some(Dur { base: 4, dots: 1 }));
-        assert_eq!(single_dur(r(3, 1)), Some(Dur { base: 2, dots: 1 }));
+        assert_eq!(single_dur(r(4, 1)), Some(Dur::new(1, 0)));
+        assert_eq!(single_dur(r(2, 1)), Some(Dur::new(2, 0)));
+        assert_eq!(single_dur(r(1, 1)), Some(Dur::new(4, 0)));
+        assert_eq!(single_dur(r(1, 2)), Some(Dur::new(8, 0)));
+        assert_eq!(single_dur(r(1, 4)), Some(Dur::new(16, 0)));
+        assert_eq!(single_dur(r(3, 4)), Some(Dur::new(8, 1)));
+        assert_eq!(single_dur(r(3, 2)), Some(Dur::new(4, 1)));
+        assert_eq!(single_dur(r(3, 1)), Some(Dur::new(2, 1)));
         assert_eq!(single_dur(r(5, 4)), None);
-        assert_eq!(
-            split_dur(r(5, 4)),
-            vec![Dur { base: 4, dots: 0 }, Dur { base: 16, dots: 0 }]
-        );
+        assert_eq!(split_dur(r(5, 4)), vec![Dur::new(4, 0), Dur::new(16, 0)]);
         assert_eq!(
             split_dur(r(7, 4)),
-            vec![
-                Dur { base: 4, dots: 0 },
-                Dur { base: 8, dots: 0 },
-                Dur { base: 16, dots: 0 }
-            ]
+            vec![Dur::new(4, 0), Dur::new(8, 0), Dur::new(16, 0)]
         );
-        assert_eq!(Dur { base: 8, dots: 1 }.to_lily(), "8.");
+        assert_eq!(Dur::new(8, 1).to_lily(), "8.");
+    }
+
+    #[test]
+    fn single_tuplet_durations() {
+        let triplet = Some((3, 2));
+        // A triplet crotchet is two thirds of a quarter note.
+        assert_eq!(
+            single_tuplet_dur(r(2, 3)),
+            Some(Dur {
+                base: 4,
+                dots: 0,
+                tuplet: triplet
+            })
+        );
+        assert_eq!(
+            single_tuplet_dur(r(1, 3)),
+            Some(Dur {
+                base: 8,
+                dots: 0,
+                tuplet: triplet
+            })
+        );
+        assert_eq!(
+            single_tuplet_dur(r(1, 6)),
+            Some(Dur {
+                base: 16,
+                dots: 0,
+                tuplet: triplet
+            })
+        );
+        assert_eq!(
+            single_tuplet_dur(r(4, 3)),
+            Some(Dur {
+                base: 2,
+                dots: 0,
+                tuplet: triplet
+            })
+        );
+        // Binary durations are also expressible as dotted tuplets (a dotted
+        // crotchet inside \tuplet 3/2 sounds one quarter), though note_durs
+        // only asks for a tuplet when no plain duration fits.
+        assert_eq!(
+            single_tuplet_dur(r(1, 1)),
+            Some(Dur {
+                base: 4,
+                dots: 1,
+                tuplet: triplet
+            })
+        );
+        assert_eq!(
+            single_tuplet_dur(r(1, 2)),
+            Some(Dur {
+                base: 8,
+                dots: 1,
+                tuplet: triplet
+            })
+        );
+        assert_eq!(single_tuplet_dur(r(5, 6)), None);
+        // The tuplet scaling is part of the length.
+        assert_eq!(
+            Dur {
+                base: 4,
+                dots: 0,
+                tuplet: triplet
+            }
+            .len(),
+            r(2, 3)
+        );
     }
 
     #[test]
@@ -601,10 +717,10 @@ mod tests {
         // 4/4 with one semiquaver per column; the bass voice of the README
         // example is two quavers, a crotchet and a minim.
         let unit = r(1, 4);
-        assert_eq!(note_durs(1, 2, 4, unit), vec![Dur { base: 8, dots: 0 }]);
-        assert_eq!(note_durs(3, 2, 4, unit), vec![Dur { base: 8, dots: 0 }]);
-        assert_eq!(note_durs(5, 4, 4, unit), vec![Dur { base: 4, dots: 0 }]);
-        assert_eq!(note_durs(9, 8, 4, unit), vec![Dur { base: 2, dots: 0 }]);
+        assert_eq!(note_durs(1, 2, 4, unit), vec![Dur::new(8, 0)]);
+        assert_eq!(note_durs(3, 2, 4, unit), vec![Dur::new(8, 0)]);
+        assert_eq!(note_durs(5, 4, 4, unit), vec![Dur::new(4, 0)]);
+        assert_eq!(note_durs(9, 8, 4, unit), vec![Dur::new(2, 0)]);
     }
 
     #[test]
@@ -612,7 +728,7 @@ mod tests {
         // The treble voice is a quaver, three pairs of tied quavers and a
         // final quaver.
         let unit = r(1, 4);
-        let quaver = Dur { base: 8, dots: 0 };
+        let quaver = Dur::new(8, 0);
         assert_eq!(note_durs(1, 2, 4, unit), vec![quaver]);
         assert_eq!(note_durs(3, 4, 4, unit), vec![quaver, quaver]);
         assert_eq!(note_durs(7, 4, 4, unit), vec![quaver, quaver]);
@@ -626,15 +742,49 @@ mod tests {
         // Five semiquavers starting on the beat: crotchet ~ semiquaver.
         assert_eq!(
             note_durs(1, 5, 4, unit),
-            vec![Dur { base: 4, dots: 0 }, Dur { base: 16, dots: 0 }]
+            vec![Dur::new(4, 0), Dur::new(16, 0)]
         );
         // Five semiquavers starting off the beat: dotted quaver ~ quaver.
         assert_eq!(
             note_durs(2, 5, 4, unit),
-            vec![Dur { base: 8, dots: 1 }, Dur { base: 8, dots: 0 }]
+            vec![Dur::new(8, 1), Dur::new(8, 0)]
         );
         // A whole bar is a single semibreve.
-        assert_eq!(note_durs(1, 16, 4, unit), vec![Dur { base: 1, dots: 0 }]);
+        assert_eq!(note_durs(1, 16, 4, unit), vec![Dur::new(1, 0)]);
+    }
+
+    #[test]
+    fn triplet_grid_durations() {
+        // A 24 column bar in 4/4 puts a triplet semiquaver on every column:
+        // three columns make a quaver and four a triplet crotchet.
+        let unit = r(1, 6);
+        let triplet = Some((3, 2));
+        let tup = |base| Dur {
+            base,
+            dots: 0,
+            tuplet: triplet,
+        };
+        // Three columns, on or off the beat: plain quavers.
+        assert_eq!(note_durs(1, 3, 6, unit), vec![Dur::new(8, 0)]);
+        assert_eq!(note_durs(4, 3, 6, unit), vec![Dur::new(8, 0)]);
+        // Four columns are a triplet crotchet wherever they start; the beat
+        // boundary a third of the way through must not split it.
+        assert_eq!(note_durs(13, 4, 6, unit), vec![tup(4)]);
+        assert_eq!(note_durs(17, 4, 6, unit), vec![tup(4)]);
+        assert_eq!(note_durs(21, 4, 6, unit), vec![tup(4)]);
+        // Two and one columns: triplet quaver and triplet semiquaver.
+        assert_eq!(note_durs(2, 2, 6, unit), vec![tup(8)]);
+        assert_eq!(note_durs(2, 1, 6, unit), vec![tup(16)]);
+        // Eight and sixteen columns: triplet minim and triplet semibreve.
+        assert_eq!(note_durs(1, 8, 6, unit), vec![tup(2)]);
+        assert_eq!(note_durs(9, 16, 6, unit), vec![tup(1)]);
+        // Six columns on the beat is a plain crotchet, not a triplet.
+        assert_eq!(note_durs(1, 6, 6, unit), vec![Dur::new(4, 0)]);
+        // An off-beat crotchet still splits into tied quavers.
+        assert_eq!(
+            note_durs(4, 6, 6, unit),
+            vec![Dur::new(8, 0), Dur::new(8, 0)]
+        );
     }
 
     #[test]

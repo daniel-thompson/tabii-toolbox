@@ -49,6 +49,25 @@ characters of width.
 |--------|
 ~~~
 
+A wider bar can also hold a ternary grid. In 4/4 a 24 column bar puts a
+triplet semiquaver on every column, so notes three columns apart are quavers
+while notes four columns apart are triplet crotchets — three in the time of
+two:
+
+~~~tab
+{signature:4/4}
+|------------------------|------------------------|
+|------------------------|------------------------|
+|------------------------|------------------------|
+|------------------------|------------------------|
+|------------------------|------------------------|
+|1--1--1--1--1--1--1--1--|1---1---1---1---1---1---|
+~~~
+
+The first bar is eight quavers. The second is six triplet crotchets, engraved
+as two `\tuplet 3/2` groups. A single bar may mix both spacings, which is how
+a bar of quavers ending in tripleted crotchets is written.
+
 
 Header
 ------
@@ -158,6 +177,23 @@ beginning). The section is engraved as a volta repeat and played twice:
 |:----------------|----------------:|
 ~~~
 
+A bar that sets the voice split can start the repeat too: `!:` is the
+voice marker and the repeat colon written as one token, at the start of a
+line or in place of a mid-line barline.
+
+~~~tab
+{signature:4/4}
+|0-------|0-------:|
+|--------|--------:|
+!:1-------|1-------:|
+|--------|--------:|
+|--------|--------:|
+|--------|--------:|
+~~~
+
+The `!:` on the third line starts the repeat at the first bar while also
+marking the voice split, exactly as a plain `!` would.
+
 Alternative endings
 -------------------
 
@@ -170,13 +206,13 @@ passes:
 
 ~~~tab
 {signature:4/4}
-                                   +1----------------+2---------------+
-|:0-------0-------|0-------0-------|0-------0-------:|0-------0-------|0---|
-|:----------------|----------------|----------------:|----------------|----|
-|:----------------|----------------|----------------:|----------------|----|
-|:----------------|----------------|----------------:|----------------|----|
-|:----------------|----------------|----------------:|----------------|----|
-|:----------------|----------------|----------------:|----------------|----|
+                   +1--------+2-------+
+|:0---0---|0---0---|0---0---:|0---0---|0-------|
+|:--------|--------|--------:|--------|--------|
+|:--------|--------|--------:|--------|--------|
+|:--------|--------|--------:|--------|--------|
+|:--------|--------|--------:|--------|--------|
+|:--------|--------|--------:|--------|--------|
 ~~~
 
 The first time through, the music after the `|:` is played and then the
@@ -198,6 +234,15 @@ input go to standard error:
 
     cargo run -- examples/aura_lee.tab > aura_lee.ly
     lilypond aura_lee.ly
+
+With `--midi` the tool writes a standard MIDI file to standard output
+instead of LilyPond source: a tempo map track (title, key and time
+signatures, tempo) followed by one track per voice, all on the General MIDI
+acoustic guitar (steel) program.  Repeats are expanded so every pass is
+played with its own alternative ending, and tied notes sound as one
+sustained note:
+
+    cargo run -- --midi examples/aura_lee.tab > aura_lee.mid
 
 The fenced example above can be converted directly from this README:
 

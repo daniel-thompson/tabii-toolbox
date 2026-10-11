@@ -11,7 +11,8 @@
 //!   `#` is a comment too; comments are ignored entirely,
 //! * `|:` in place of a barline starts a repeated section and `:|` ends
 //!   one; a `:|` without a matching `|:` repeats from the previous `:|`
-//!   (or from the beginning),
+//!   (or from the beginning); `!:` does what `|:` does while also marking
+//!   the voice split like `!`,
 //! * a line above a system made of `+` markers and digits marks volta
 //!   endings: a `+N` sitting on a barline starts ending N there and the
 //!   ending runs to the next `+` (or the end of the line),
@@ -783,18 +784,24 @@ fn read_barline(chars: &[char], i: usize) -> (Barline, char, bool, usize) {
             Some('|') => (Barline::Double, '|', false, 2),
             _ => (Barline::Single, '|', false, 1),
         },
-        '!' => (Barline::Single, '!', false, 1),
+        // `!:` marks the voice split and starts a repeated section.
+        '!' => match chars.get(i + 1) {
+            Some(':') => (Barline::Single, '!', true, 2),
+            _ => (Barline::Single, '!', false, 1),
+        },
         _ => (Barline::RepeatEnd, '|', false, 2), // `:|`
     }
 }
 
 /// Split one tab line into its bars. Barlines are `|`, `!` (voice split),
-/// `|:` (repeat start), `:|` (repeat end) and `||` (double); a barline
-/// between two bars closes the first and marks the second.
+/// `|:` (repeat start), `!:` (voice split and repeat start), `:|` (repeat
+/// end) and `||` (double); a barline between two bars closes the first and
+/// marks the second.
 fn parse_tab_line(line: &str) -> Option<Vec<ParsedBar>> {
     let chars: Vec<char> = line.chars().collect();
-    // The leading barline: `|`, `!` or `|:`.
+    // The leading barline: `|`, `!`, `|:` or `!:`.
     let (mut marker, mut marker_col, mut repeat_start, mut i) = match chars.first()? {
+        '!' if chars.get(1) == Some(&':') => ('!', 0, true, 2),
         '!' => ('!', 0, false, 1),
         '|' if chars.get(1) == Some(&':') => ('|', 0, true, 2),
         '|' => ('|', 0, false, 1),
@@ -1198,6 +1205,68 @@ F#  C#7 # the verse
     }
 
     #[test]
+    fn bang_colon_starts_repeat_with_split() {
+        // `!:` starts a repeated section on the bar that also sets the
+        // voice split — the `!` marker and the repeat colon as one token,
+        // at the start of a line or in place of a mid-line barline.
+        let tab = parse(
+            "\
+{signature:4/4}
+|0-------|0-------:|
+|--------|--------:|
+!:1-------|1-------:|
+|--------|--------:|
+|--------|--------:|
+|--------|--------:|
+",
+        )
+        .unwrap();
+        assert!(tab.warnings.is_empty(), "warnings: {:?}", tab.warnings);
+        // The first bar starts the repeat, and the split sits on the third
+        // string line, so its fret belongs to the treble voice.
+        assert!(tab.systems[0].bars[0].repeat_start);
+        assert_eq!(tab.systems[0].bars[0].voice_split, Some(2));
+        assert_eq!(
+            tab.systems[0].bars[0].strings[2],
+            vec![StringEvent::Onset {
+                col: 1,
+                fret: 1,
+                arpeggio: false
+            }]
+        );
+        assert_eq!(tab.systems[0].bars[1].close, Barline::RepeatEnd);
+
+        let tab = parse(
+            "\
+{signature:4/4}
+|0-------|0-------:|
+|--------|--------:|
+!1-------!:1-------:|
+|--------|--------:|
+|--------|--------:|
+|--------|--------:|
+",
+        )
+        .unwrap();
+        assert!(tab.warnings.is_empty(), "warnings: {:?}", tab.warnings);
+        // The plain `!` on the first bar only sets the split; the `!:` on
+        // the second bar sets it and starts the (single bar) repeat.
+        assert_eq!(tab.systems[0].bars[0].voice_split, Some(2));
+        assert!(!tab.systems[0].bars[0].repeat_start);
+        assert!(tab.systems[0].bars[1].repeat_start);
+        assert_eq!(tab.systems[0].bars[1].voice_split, Some(2));
+        assert_eq!(
+            tab.systems[0].bars[1].strings[2],
+            vec![StringEvent::Onset {
+                col: 1,
+                fret: 1,
+                arpeggio: false
+            }]
+        );
+        assert_eq!(tab.systems[0].bars[1].close, Barline::RepeatEnd);
+    }
+
+    #[test]
     fn comments_are_ignored() {
         // Comments may appear anywhere, even between the lines of a system,
         // and are ignored entirely.
@@ -1239,9 +1308,9 @@ F#  C#7 # the verse
 
     #[test]
     fn readme_md_itself_parses() {
-        // The nine fenced examples inside README.md should all be found.
+        // The eleven fenced examples inside README.md should all be found.
         let tab = parse(include_str!("../README.md")).unwrap();
-        assert_eq!(tab.systems.len(), 9);
+        assert_eq!(tab.systems.len(), 11);
         // The first example shows the same music in bars of four different
         // widths.
         assert_eq!(tab.systems[0].bars.len(), 4);
@@ -1285,12 +1354,31 @@ F#  C#7 # the verse
                 arpeggio: false
             }]
         );
-        assert_eq!(tab.systems[2].bars.len(), 1);
+        // The third example shows a ternary grid: a 24 column bar in 4/4
+        // holds eight quavers three columns apart, or six triplet crotchets
+        // four columns apart.
+        assert_eq!(tab.systems[2].bars.len(), 2);
         assert_eq!(tab.systems[2].time_sig, TimeSig { num: 4, den: 4 });
-        // The fourth example splits at the third string and moves the split
-        // to the fourth string with a `.` in the eighth column.
+        let widths: Vec<usize> = tab.systems[2].bars.iter().map(|b| b.width).collect();
+        assert_eq!(widths, vec![24, 24]);
+        let quaver_cols: Vec<usize> = tab.systems[2].bars[0].strings[5]
+            .iter()
+            .map(|event| event.col())
+            .collect();
+        assert_eq!(quaver_cols, vec![1, 4, 7, 10, 13, 16, 19, 22]);
+        let triplet_cols: Vec<usize> = tab.systems[2].bars[1].strings[5]
+            .iter()
+            .map(|event| event.col())
+            .collect();
+        assert_eq!(triplet_cols, vec![1, 5, 9, 13, 17, 21]);
+        // The fourth example is the voices one: a single bar with a
+        // `{signature:4/4}` header.
         assert_eq!(tab.systems[3].bars.len(), 1);
-        let bar = &tab.systems[3].bars[0];
+        assert_eq!(tab.systems[3].time_sig, TimeSig { num: 4, den: 4 });
+        // The fifth example splits at the third string and moves the split
+        // to the fourth string with a `.` in the eighth column.
+        assert_eq!(tab.systems[4].bars.len(), 1);
+        let bar = &tab.systems[4].bars[0];
         assert_eq!(bar.voice_split, Some(2));
         assert_eq!(bar.split_changes, vec![(8, 3)]);
         assert_eq!(
@@ -1308,52 +1396,58 @@ F#  C#7 # the verse
                 },
             ]
         );
-        // The fifth example has no metadata (defaulting to 4/4) and no
+        // The sixth example has no metadata (defaulting to 4/4) and no
         // marker on its second bar, which keeps the first bar's split.
-        assert_eq!(tab.systems[4].bars.len(), 2);
-        assert_eq!(tab.systems[4].time_sig, TimeSig { num: 4, den: 4 });
-        assert_eq!(tab.systems[4].bars[0].voice_split, Some(2));
-        assert_eq!(tab.systems[4].bars[1].voice_split, Some(2));
-        // The sixth example marks its second bar single voice with a `!` on
-        // the bottom string.
         assert_eq!(tab.systems[5].bars.len(), 2);
+        assert_eq!(tab.systems[5].time_sig, TimeSig { num: 4, den: 4 });
         assert_eq!(tab.systems[5].bars[0].voice_split, Some(2));
-        assert_eq!(tab.systems[5].bars[1].voice_split, Some(5));
-        // The seventh example marks an arpeggiated chord: every note starts
+        assert_eq!(tab.systems[5].bars[1].voice_split, Some(2));
+        // The seventh example marks its second bar single voice with a `!` on
+        // the bottom string.
+        assert_eq!(tab.systems[6].bars.len(), 2);
+        assert_eq!(tab.systems[6].bars[0].voice_split, Some(2));
+        assert_eq!(tab.systems[6].bars[1].voice_split, Some(5));
+        // The eighth example marks an arpeggiated chord: every note starts
         // on the `~` in the first column, not on the fret number next to
         // it. It has no marker of its own, so it keeps the single-voice
-        // split (`!` on the bottom string) from the sixth example.
-        assert_eq!(tab.systems[6].bars.len(), 1);
-        assert_eq!(tab.systems[6].bars[0].voice_split, Some(5));
+        // split (`!` on the bottom string) from the seventh example.
+        assert_eq!(tab.systems[7].bars.len(), 1);
+        assert_eq!(tab.systems[7].bars[0].voice_split, Some(5));
         assert_eq!(
-            tab.systems[6].bars[0].strings[0],
+            tab.systems[7].bars[0].strings[0],
             vec![StringEvent::Onset {
                 col: 1,
                 fret: 0,
                 arpeggio: true
             }]
         );
-        // The eighth example is a repeated section: `|:` starts it and `:|`
+        // The ninth example is a repeated section: `|:` starts it and `:|`
         // ends it.
-        assert_eq!(tab.systems[7].bars.len(), 2);
-        assert!(tab.systems[7].bars[0].repeat_start);
-        assert_eq!(tab.systems[7].bars[1].close, Barline::RepeatEnd);
-        assert_eq!(tab.systems[7].bars[0].voice_split, Some(5));
-        // The ninth example repeats with two alternative endings that
+        assert_eq!(tab.systems[8].bars.len(), 2);
+        assert!(tab.systems[8].bars[0].repeat_start);
+        assert_eq!(tab.systems[8].bars[1].close, Barline::RepeatEnd);
+        assert_eq!(tab.systems[8].bars[0].voice_split, Some(5));
+        // The tenth example starts the repeat with `!:` on the bar that
+        // also sets the voice split.
+        assert_eq!(tab.systems[9].bars.len(), 2);
+        assert!(tab.systems[9].bars[0].repeat_start);
+        assert_eq!(tab.systems[9].bars[0].voice_split, Some(2));
+        assert_eq!(tab.systems[9].bars[1].close, Barline::RepeatEnd);
+        // The eleventh example repeats with two alternative endings that
         // share their system with the body: the indented endings line
         // marks the third bar (volta 1, closed by `:|`) and the last two
-        // bars (volta 2, the last only four columns wide).
-        assert_eq!(tab.systems[8].bars.len(), 5);
-        let widths: Vec<usize> = tab.systems[8].bars.iter().map(|b| b.width).collect();
-        assert_eq!(widths, vec![16, 16, 16, 16, 4]);
-        assert!(tab.systems[8].bars[0].repeat_start);
-        assert_eq!(tab.systems[8].bars[0].ending, None);
-        assert_eq!(tab.systems[8].bars[1].ending, None);
-        assert_eq!(tab.systems[8].bars[2].ending, Some(1));
-        assert_eq!(tab.systems[8].bars[2].close, Barline::RepeatEnd);
-        assert_eq!(tab.systems[8].bars[3].ending, Some(2));
-        assert_eq!(tab.systems[8].bars[4].ending, Some(2));
-        assert_eq!(tab.systems[8].bars[4].close, Barline::Single);
+        // bars (volta 2).
+        assert_eq!(tab.systems[10].bars.len(), 5);
+        let widths: Vec<usize> = tab.systems[10].bars.iter().map(|b| b.width).collect();
+        assert_eq!(widths, vec![8, 8, 8, 8, 8]);
+        assert!(tab.systems[10].bars[0].repeat_start);
+        assert_eq!(tab.systems[10].bars[0].ending, None);
+        assert_eq!(tab.systems[10].bars[1].ending, None);
+        assert_eq!(tab.systems[10].bars[2].ending, Some(1));
+        assert_eq!(tab.systems[10].bars[2].close, Barline::RepeatEnd);
+        assert_eq!(tab.systems[10].bars[3].ending, Some(2));
+        assert_eq!(tab.systems[10].bars[4].ending, Some(2));
+        assert_eq!(tab.systems[10].bars[4].close, Barline::Single);
     }
 
     #[test]

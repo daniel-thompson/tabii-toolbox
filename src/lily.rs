@@ -6,7 +6,10 @@
 //! the next event in its voice (or the end of its bar); notes that start off
 //! the beat and cross a beat boundary are written as tied notes, which is
 //! what turns the off-beat crotchets of the README example into pairs of
-//! tied quavers.
+//! tied quavers.  On a wider ternary grid (24 columns per 4/4 bar) lengths
+//! that only exist as tuplets, such as triplet crotchets, are written as
+//! single tuplet notes, and consecutive tuplet notes are grouped into
+//! `\tuplet` blocks.
 
 use crate::music::{
     Chord, Dur, Rational, Spelling, SpellingMap, TimeSig, chord_spelling_map, key_spelling_map,
@@ -15,11 +18,11 @@ use crate::music::{
 use crate::parser::{Bar, Barline, StringEvent, System, Tab};
 
 const LILYPOND_VERSION: &str = "2.24.0";
-const STRING_COUNT: usize = 6;
+pub(crate) const STRING_COUNT: usize = 6;
 
 /// Which staff voice a stream of music belongs to.
 #[derive(Clone, Copy, PartialEq, Eq)]
-enum Voice {
+pub(crate) enum Voice {
     Single,
     Upper,
     Lower,
@@ -27,19 +30,19 @@ enum Voice {
 
 /// The volta structure at one bar of the whole tab.
 #[derive(Clone, Copy, Default)]
-struct VoltaBar {
+pub(crate) struct VoltaBar {
     /// `\repeat volta N {` opens at this bar.
-    start: Option<usize>,
+    pub(crate) start: Option<usize>,
     /// The repeat body closes at this bar (`}`).
-    body_end: bool,
+    pub(crate) body_end: bool,
     /// `\alternative {` opens at this bar, before the first alternative.
-    alt_list_start: bool,
+    pub(crate) alt_list_start: bool,
     /// `\volta N {` opens at this bar.
-    alt_start: Option<usize>,
+    pub(crate) alt_start: Option<usize>,
     /// The current `\volta` block closes at this bar (`}`).
-    alt_end: bool,
+    pub(crate) alt_end: bool,
     /// The `\alternative` block closes after this bar (`}`).
-    alt_list_end: bool,
+    pub(crate) alt_list_end: bool,
 }
 
 /// Generate LilyPond source for a parsed tab, plus any warnings raised while
@@ -104,7 +107,7 @@ pub fn generate(tab: &Tab) -> (String, Vec<String>) {
 /// number (from a `+N` marker) become the alternatives of the section: the
 /// body ends just before the first of them and each run of equal numbers
 /// forms one `\volta`.
-fn volta_marks(tab: &Tab, warnings: &mut Vec<String>) -> Vec<VoltaBar> {
+pub(crate) fn volta_marks(tab: &Tab, warnings: &mut Vec<String>) -> Vec<VoltaBar> {
     let bars: Vec<&Bar> = tab.systems.iter().flat_map(|s| s.bars.iter()).collect();
     let total = bars.len();
     let mut marks = vec![VoltaBar::default(); total];
@@ -288,14 +291,14 @@ impl VoiceState {
 }
 
 /// One event in a voice's timeline: new notes and/or tied continuations.
-struct Event {
+pub(crate) struct Event {
     /// 0-based column within the system.
-    abs: usize,
-    bar: usize,
+    pub(crate) abs: usize,
+    pub(crate) bar: usize,
     /// `(string, fret, arpeggiated)` per struck string.
-    onsets: Vec<(usize, u8, bool)>,
-    ties: Vec<usize>,
-    duration: usize,
+    pub(crate) onsets: Vec<(usize, u8, bool)>,
+    pub(crate) ties: Vec<usize>,
+    pub(crate) duration: usize,
 }
 
 /// The immutable context for rendering one voice of one piece.
@@ -388,6 +391,7 @@ fn render_voice_system(
 
     let mut tokens: Vec<String> = Vec::new();
     let mut lines: Vec<String> = Vec::new();
+    let mut tuplets = TupletGroups::new(beat_len(&timings[0]));
     let mut pos = 0usize;
     let mut bar = 0usize;
     push_volta_opens(&mut tokens, &piece.volta[bar_offset]);
@@ -414,7 +418,8 @@ fn render_voice_system(
             let bar_end = system.bars[bar].start + system.bars[bar].width;
             if pos < bar_end {
                 let prefix = if voiced[bar] { 'r' } else { 's' };
-                tokens.extend(filler(
+                tuplets.push_filler(
+                    &mut tokens,
                     prefix,
                     &note_durs(
                         col_of(pos, &system.bars[bar]),
@@ -422,25 +427,28 @@ fn render_voice_system(
                         timings[bar].1,
                         timings[bar].0,
                     ),
-                ));
+                );
             }
             pos = bar_end;
             if tie_pending {
-                push_tie(&mut tokens);
+                tuplets.tie_last(&mut tokens);
                 tie_pending = false;
             }
             let suffix = bar_suffix(system, bar, n_bars, voice, system_index == last_system);
             // The closing brace of a volta repeat draws the `:|` barline
             // itself; so do the braces around alternatives.
             let suffix = close_volta_blocks(suffix, &piece.volta[bar_offset + bar]);
+            tuplets.close(&mut tokens);
             flush_bar(&mut tokens, &mut lines, &suffix);
             bar += 1;
             if bar < n_bars {
+                tuplets.beat = beat_len(&timings[bar]);
                 push_volta_opens(&mut tokens, &piece.volta[bar_offset + bar]);
             }
         }
         if event.abs > pos {
-            tokens.extend(filler(
+            tuplets.push_filler(
+                &mut tokens,
                 'r',
                 &note_durs(
                     col_of(pos, &system.bars[bar]),
@@ -448,10 +456,10 @@ fn render_voice_system(
                     timings[bar].1,
                     timings[bar].0,
                 ),
-            ));
+            );
         }
         if tie_pending {
-            push_tie(&mut tokens);
+            tuplets.tie_last(&mut tokens);
         }
 
         // Tied notes keep their spelling; onsets are spelled in the context
@@ -474,7 +482,8 @@ fn render_voice_system(
 
         let event_id = state.last_event_id + 1;
         if notes.is_empty() {
-            tokens.extend(filler(
+            tuplets.push_filler(
+                &mut tokens,
                 'r',
                 &note_durs(
                     col_of(event.abs, &system.bars[event.bar]),
@@ -482,7 +491,7 @@ fn render_voice_system(
                     timings[event.bar].1,
                     timings[event.bar].0,
                 ),
-            ));
+            );
         } else {
             let (pitch_text, string_suffix) = chord_text(&notes, tab_mode);
             let durs = note_durs(
@@ -493,7 +502,7 @@ fn render_voice_system(
             );
             for (i, dur) in durs.iter().enumerate() {
                 if i > 0 {
-                    push_tie(&mut tokens);
+                    tuplets.tie_last(&mut tokens);
                 }
                 let mut token = format!("{pitch_text}{}{string_suffix}", dur.to_lily());
                 // The arpeggio marks the attack, so only the first of a
@@ -501,7 +510,7 @@ fn render_voice_system(
                 if arpeggio && i == 0 {
                     token.push_str("\\arpeggio");
                 }
-                tokens.push(token);
+                tuplets.push(&mut tokens, *dur, token);
             }
             for &(string, midi, ref name) in &notes {
                 state.strings[string] = Some(StringState {
@@ -520,7 +529,8 @@ fn render_voice_system(
         let bar_end = system.bars[bar].start + system.bars[bar].width;
         if pos < bar_end {
             let prefix = if voiced[bar] { 'r' } else { 's' };
-            tokens.extend(filler(
+            tuplets.push_filler(
+                &mut tokens,
                 prefix,
                 &note_durs(
                     col_of(pos, &system.bars[bar]),
@@ -528,14 +538,16 @@ fn render_voice_system(
                     timings[bar].1,
                     timings[bar].0,
                 ),
-            ));
+            );
         }
         pos = bar_end;
         let suffix = bar_suffix(system, bar, n_bars, voice, system_index == last_system);
         let suffix = close_volta_blocks(suffix, &piece.volta[bar_offset + bar]);
+        tuplets.close(&mut tokens);
         flush_bar(&mut tokens, &mut lines, &suffix);
         bar += 1;
         if bar < n_bars {
+            tuplets.beat = beat_len(&timings[bar]);
             push_volta_opens(&mut tokens, &piece.volta[bar_offset + bar]);
         }
     }
@@ -544,7 +556,11 @@ fn render_voice_system(
 
 /// Build a voice's event timeline for one system, merging simultaneous
 /// events and computing durations.
-fn build_events(system: &System, voice: Voice, warnings: &mut Vec<String>) -> Vec<Event> {
+pub(crate) fn build_events(
+    system: &System,
+    voice: Voice,
+    warnings: &mut Vec<String>,
+) -> Vec<Event> {
     let n_bars = system.bars.len();
     let mut raw: Vec<Event> = Vec::new();
     for bar in 0..n_bars {
@@ -692,11 +708,79 @@ fn active_chord(system: &System, bar: usize, col: usize) -> Option<Chord> {
         .map(|slot| slot.chord)
 }
 
-/// Rest or skip tokens (`prefix` is `r` or `s`) covering a stretch of time.
-fn filler(prefix: char, durs: &[Dur]) -> Vec<String> {
-    durs.iter()
-        .map(|dur| format!("{prefix}{}", dur.to_lily()))
-        .collect()
+/// The sounding length of one beat of a bar (zero when the bar width has no
+/// beat grid).
+fn beat_len(timing: &(Rational, usize)) -> Rational {
+    timing.0 * Rational::integer(timing.1 as i64)
+}
+
+/// Emits tokens while wrapping runs of tuplet-duration tokens in
+/// `\tuplet n/d { }` blocks.  A block closes when its contents fill a whole
+/// number of beats (so triplet crotchets group in threes across two beats),
+/// when a non-tuplet token arrives, or at the end of a bar.
+struct TupletGroups {
+    /// The ratio of the currently open block, if any.
+    open: Option<(u32, u32)>,
+    /// Sounding length accumulated inside the open block.
+    filled: Rational,
+    /// Length of one beat of the current bar (zero without a beat grid).
+    beat: Rational,
+}
+
+impl TupletGroups {
+    fn new(beat: Rational) -> Self {
+        TupletGroups {
+            open: None,
+            filled: Rational::integer(0),
+            beat,
+        }
+    }
+
+    fn push(&mut self, tokens: &mut Vec<String>, dur: Dur, token: String) {
+        if self.open != dur.tuplet {
+            self.close(tokens);
+            if let Some((num, den)) = dur.tuplet {
+                tokens.push(format!("\\tuplet {num}/{den} {{"));
+                self.filled = Rational::integer(0);
+            }
+            self.open = dur.tuplet;
+        }
+        tokens.push(token);
+        if dur.tuplet.is_some() {
+            self.filled = self.filled + dur.len();
+            if self.beat.is_positive() && (self.filled / self.beat).is_integer() {
+                self.close(tokens);
+            }
+        }
+    }
+
+    /// Push rest or skip tokens covering a stretch of time (`prefix` is `r`
+    /// or `s`).
+    fn push_filler(&mut self, tokens: &mut Vec<String>, prefix: char, durs: &[Dur]) {
+        for dur in durs {
+            self.push(tokens, *dur, format!("{prefix}{}", dur.to_lily()));
+        }
+    }
+
+    /// Attach a tie to the most recent note token, looking past a tuplet
+    /// block that closed right after it.
+    fn tie_last(&self, tokens: &mut Vec<String>) {
+        if tokens.last().map(String::as_str) == Some("}") {
+            tokens.pop();
+            if let Some(note) = tokens.last_mut() {
+                note.push('~');
+            }
+            tokens.push("}".to_string());
+        } else if let Some(last) = tokens.last_mut() {
+            last.push('~');
+        }
+    }
+
+    fn close(&mut self, tokens: &mut Vec<String>) {
+        if self.open.take().is_some() {
+            tokens.push("}".to_string());
+        }
+    }
 }
 
 /// Pitch text for one note event, plus a suffix to place after the duration.
@@ -724,13 +808,6 @@ fn chord_text(notes: &[(usize, i32, String)], with_strings: bool) -> (String, St
             })
             .collect();
         (format!("<{}>", names.join(" ")), String::new())
-    }
-}
-
-/// Attach a tie to the most recent token.
-fn push_tie(tokens: &mut [String]) {
-    if let Some(last) = tokens.last_mut() {
-        last.push('~');
     }
 }
 
@@ -846,6 +923,7 @@ fn chord_lines(tab: &Tab, volta: &[VoltaBar]) -> Vec<String> {
                 0
             };
             let mut tokens: Vec<String> = Vec::new();
+            let mut tuplets = TupletGroups::new(unit * Rational::integer(beat_cols as i64));
             push_volta_opens(&mut tokens, &volta[bar_offset]);
             let mut pos = start;
             for (i, &(abs, chord)) in slots.iter().enumerate() {
@@ -856,10 +934,11 @@ fn chord_lines(tab: &Tab, volta: &[VoltaBar]) -> Vec<String> {
                     break;
                 }
                 if abs > pos {
-                    tokens.extend(filler(
+                    tuplets.push_filler(
+                        &mut tokens,
                         's',
                         &note_durs(col_of(pos, bar_ref), abs - pos, beat_cols, unit),
-                    ));
+                    );
                 }
                 let next = slots
                     .get(i + 1)
@@ -869,23 +948,25 @@ fn chord_lines(tab: &Tab, volta: &[VoltaBar]) -> Vec<String> {
                 let durs = note_durs(col_of(abs, bar_ref), next - abs, beat_cols, unit);
                 for (di, dur) in durs.iter().enumerate() {
                     if di > 0 {
-                        push_tie(&mut tokens);
+                        tuplets.tie_last(&mut tokens);
                     }
-                    tokens.push(chord.lily_with_duration(&dur.to_lily()));
+                    tuplets.push(&mut tokens, *dur, chord.lily_with_duration(&dur.to_lily()));
                 }
                 pos = next;
             }
             if pos < end {
-                tokens.extend(filler(
+                tuplets.push_filler(
+                    &mut tokens,
                     's',
                     &note_durs(col_of(pos, bar_ref), end - pos, beat_cols, unit),
-                ));
+                );
             }
             let mut suffix = String::new();
             if bar + 1 == system.bars.len() && si != last_system {
                 suffix.push_str("\\break");
             }
             let suffix = close_volta_blocks(suffix, &volta[bar_offset]);
+            tuplets.close(&mut tokens);
             flush_bar(&mut tokens, &mut lines, &suffix);
             bar_offset += 1;
         }
@@ -1060,6 +1141,70 @@ mod tests {
     }
 
     #[test]
+    fn triplet_grid_lilypond() {
+        // The third README example: a 24 column bar in 4/4 holds eight
+        // quavers three columns apart, or six triplet crotchets four
+        // columns apart.
+        let tab = parse(
+            "\
+{signature:4/4}
+|------------------------|------------------------|
+|------------------------|------------------------|
+|------------------------|------------------------|
+|------------------------|------------------------|
+|------------------------|------------------------|
+|1--1--1--1--1--1--1--1--|1---1---1---1---1---1---|
+",
+        )
+        .unwrap();
+        let (lilypond, warnings) = generate(&tab);
+        assert!(warnings.is_empty(), "warnings: {warnings:?}");
+        // Eight quavers in the first bar.
+        assert!(lilypond.contains("f,8 f,8 f,8 f,8 f,8 f,8 f,8 f,8 |"));
+        // Six triplet crotchets in the second bar, grouped in threes.
+        assert!(lilypond.contains("\\tuplet 3/2 { f,4 f,4 f,4 } \\tuplet 3/2 { f,4 f,4 f,4 } |"));
+        // The tablature staff repeats them with string numbers.
+        assert!(lilypond.contains("f,8\\6 f,8\\6 f,8\\6 f,8\\6 f,8\\6 f,8\\6 f,8\\6 f,8\\6 |"));
+        assert!(lilypond.contains(
+            "\\tuplet 3/2 { f,4\\6 f,4\\6 f,4\\6 } \\tuplet 3/2 { f,4\\6 f,4\\6 f,4\\6 } |"
+        ));
+    }
+
+    #[test]
+    fn cant_help_falling_in_love_lilypond() {
+        // The opening system of examples/cant_help_falling_in_love.tab: a
+        // 24 column grid whose second bar mixes quavers with triplet
+        // crotchets and whose third holds nothing but triplet lengths.
+        let tab = parse(
+            "\
+{title:Can't Help Falling In Love}
+{tempo:90}
+
+|------------------------|----------------0---1---|------------------------|
+|-----------.0-----------!1-----------3-----------|------------------------|
+!2-----------------0-----|------0---------0---2---|------------------------|
+|------3--------0-----0--|---2-----2--0-----------|------------------------|
+|---3-----3--------------|------------------------|------------------------|
+|1-----------1-----------|0-----------------------|0-------0---------------|
+",
+        )
+        .unwrap();
+        let (lilypond, warnings) = generate(&tab);
+        assert!(warnings.is_empty(), "warnings: {warnings:?}");
+        // Bar 1: eight quavers in the bass under two minims in the treble.
+        assert!(lilypond.contains("a2 b2 |"));
+        assert!(lilypond.contains("f,8 c8 f8 c8 f,8 d8 g8 d8 |"));
+        // Bar 2: four quavers then three triplet crotchets in both voices.
+        assert!(lilypond.contains("c'2 \\tuplet 3/2 { d'4 e'4 f'4 } |"));
+        assert!(lilypond.contains("e,8 e8 g8 e8 \\tuplet 3/2 { d4 g4 a4 } |"));
+        // Bar 3: a triplet minim and a triplet semibreve in the bass.
+        assert!(lilypond.contains("\\tuplet 3/2 { e,2 e,1 } |"));
+        // The tablature staff carries the same rhythm with string numbers.
+        assert!(lilypond.contains("c'2\\2 \\tuplet 3/2 { d'4\\2 e'4\\1 f'4\\1 } |"));
+        assert!(lilypond.contains("e,8\\6 e8\\4 g8\\3 e8\\4 \\tuplet 3/2 { d4\\4 g4\\3 a4\\3 } |"));
+    }
+
+    #[test]
     fn suicide_is_painless_lilypond() {
         let tab = parse(include_str!("../examples/suicide_is_painless.tab")).unwrap();
         let (lilypond, warnings) = generate(&tab);
@@ -1122,6 +1267,31 @@ mod tests {
         );
         assert_eq!(lilypond.matches("e'2\\1 e'2\\1 | }").count(), 1);
         assert!(!lilypond.contains("\\bar"));
+    }
+
+    #[test]
+    fn bang_colon_repeat_lilypond() {
+        // `!:` starts the repeat on the bar that also sets the voice split,
+        // so the volta is engraved and the split produces two voices.
+        let tab = parse(
+            "\
+{signature:4/4}
+|0-------|0-------:|
+|--------|--------:|
+!:1-------|1-------:|
+|--------|--------:|
+|--------|--------:|
+|--------|--------:|
+",
+        )
+        .unwrap();
+        let (lilypond, warnings) = generate(&tab);
+        assert!(warnings.is_empty(), "warnings: {warnings:?}");
+        // The volta appears in every voice stream: upper and lower on both
+        // the conventional staff and the tab staff.
+        assert_eq!(lilypond.matches("\\repeat volta 2 {").count(), 4);
+        assert!(lilypond.contains("\\new Voice = \"upper\""));
+        assert!(lilypond.contains("\\new Voice = \"lower\""));
     }
 
     #[test]
