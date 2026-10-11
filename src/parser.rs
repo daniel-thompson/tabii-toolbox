@@ -62,13 +62,21 @@ pub struct Bar {
     pub strings: Vec<Vec<StringEvent>>,
 }
 
-/// An event on one string: a fretted note, a tie mark, or a `.` split
-/// change.
+/// An event on one string: a fretted note (optionally marked as part of an
+/// arpeggio), a tie mark, or a `.` split change.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum StringEvent {
-    Onset { col: usize, fret: u8 },
-    Tie { col: usize },
-    Split { col: usize },
+    Onset {
+        col: usize,
+        fret: u8,
+        arpeggio: bool,
+    },
+    Tie {
+        col: usize,
+    },
+    Split {
+        col: usize,
+    },
 }
 
 impl StringEvent {
@@ -291,19 +299,39 @@ impl Parser {
         });
     }
 
-    /// Extract fret onsets and tie marks from one bar of one string.
+    /// Extract fret onsets, tie marks and split changes from one bar of one
+    /// string.
     fn parse_string_events(&mut self, chunk: &str) -> Vec<StringEvent> {
         let mut events = Vec::new();
+        // A `~` before a fret number marks an arpeggiated note that starts
+        // on the `~`'s column rather than the number's.
+        let mut arpeggio: Option<usize> = None;
         for (i, ch) in chunk.chars().enumerate() {
+            let col = i + 1;
             match ch {
-                '-' | ' ' => {}
-                '0'..='9' => events.push(StringEvent::Onset {
-                    col: i + 1,
-                    fret: ch as u8 - b'0',
-                }),
-                '^' => events.push(StringEvent::Tie { col: i + 1 }),
-                '.' => events.push(StringEvent::Split { col: i + 1 }),
+                '0'..='9' => {
+                    let (onset, arpeggiated) = match arpeggio.take() {
+                        Some(start) => (start, true),
+                        None => (col, false),
+                    };
+                    events.push(StringEvent::Onset {
+                        col: onset,
+                        fret: ch as u8 - b'0',
+                        arpeggio: arpeggiated,
+                    });
+                }
+                '-' | ' ' => self.drop_arpeggio(&mut arpeggio),
+                '^' => {
+                    self.drop_arpeggio(&mut arpeggio);
+                    events.push(StringEvent::Tie { col });
+                }
+                '.' => {
+                    self.drop_arpeggio(&mut arpeggio);
+                    events.push(StringEvent::Split { col });
+                }
+                '~' => arpeggio = Some(col),
                 _ => {
+                    self.drop_arpeggio(&mut arpeggio);
                     if self.unknown_chars.insert(ch) {
                         self.tab.warnings.push(format!(
                             "ignoring unsupported character {ch:?} in tab (treated as a gap)"
@@ -312,7 +340,19 @@ impl Parser {
                 }
             }
         }
+        self.drop_arpeggio(&mut arpeggio);
         events
+    }
+
+    /// A `~` must be followed by a fret number; anything else after it (or
+    /// the end of the bar) leaves the mark dangling, which is warned about
+    /// once and treated as a gap.
+    fn drop_arpeggio(&mut self, arpeggio: &mut Option<usize>) {
+        if arpeggio.take().is_some() && self.unknown_chars.insert('~') {
+            self.tab
+                .warnings
+                .push("ignoring '~' not followed by a fret number (treated as a gap)".to_string());
+        }
     }
 
     /// Map the pending chord symbols onto bars using the system's grid.
@@ -588,34 +628,79 @@ s:4/4
         assert_eq!(
             bar.strings[0],
             vec![
-                StringEvent::Onset { col: 11, fret: 2 },
-                StringEvent::Onset { col: 15, fret: 5 }
+                StringEvent::Onset {
+                    col: 11,
+                    fret: 2,
+                    arpeggio: false
+                },
+                StringEvent::Onset {
+                    col: 15,
+                    fret: 5,
+                    arpeggio: false
+                }
             ]
         );
-        assert_eq!(bar.strings[1], vec![StringEvent::Onset { col: 7, fret: 4 }]);
-        assert_eq!(bar.strings[2], vec![StringEvent::Onset { col: 3, fret: 2 }]);
-        assert_eq!(bar.strings[3], vec![StringEvent::Onset { col: 1, fret: 4 }]);
+        assert_eq!(
+            bar.strings[1],
+            vec![StringEvent::Onset {
+                col: 7,
+                fret: 4,
+                arpeggio: false
+            }]
+        );
+        assert_eq!(
+            bar.strings[2],
+            vec![StringEvent::Onset {
+                col: 3,
+                fret: 2,
+                arpeggio: false
+            }]
+        );
+        assert_eq!(
+            bar.strings[3],
+            vec![StringEvent::Onset {
+                col: 1,
+                fret: 4,
+                arpeggio: false
+            }]
+        );
         assert_eq!(
             bar.strings[4],
             vec![
-                StringEvent::Onset { col: 5, fret: 2 },
-                StringEvent::Onset { col: 9, fret: 4 }
+                StringEvent::Onset {
+                    col: 5,
+                    fret: 2,
+                    arpeggio: false
+                },
+                StringEvent::Onset {
+                    col: 9,
+                    fret: 4,
+                    arpeggio: false
+                }
             ]
         );
         assert_eq!(
             bar.strings[5],
             vec![
-                StringEvent::Onset { col: 1, fret: 2 },
-                StringEvent::Onset { col: 3, fret: 5 }
+                StringEvent::Onset {
+                    col: 1,
+                    fret: 2,
+                    arpeggio: false
+                },
+                StringEvent::Onset {
+                    col: 3,
+                    fret: 5,
+                    arpeggio: false
+                }
             ]
         );
     }
 
     #[test]
     fn readme_md_itself_parses() {
-        // All four fenced examples inside README.md should be found.
+        // All five fenced examples inside README.md should be found.
         let tab = parse(include_str!("../README.md")).unwrap();
-        assert_eq!(tab.systems.len(), 4);
+        assert_eq!(tab.systems.len(), 5);
         assert_eq!(tab.systems[0].bars.len(), 1);
         assert_eq!(tab.systems[0].time_sig, TimeSig { num: 4, den: 4 });
         // The second example splits at the third string and moves the split
@@ -627,8 +712,16 @@ s:4/4
         assert_eq!(
             bar.strings[3],
             vec![
-                StringEvent::Onset { col: 5, fret: 2 },
-                StringEvent::Onset { col: 9, fret: 4 },
+                StringEvent::Onset {
+                    col: 5,
+                    fret: 2,
+                    arpeggio: false
+                },
+                StringEvent::Onset {
+                    col: 9,
+                    fret: 4,
+                    arpeggio: false
+                },
             ]
         );
         // The third example has no metadata (defaulting to 4/4) and no
@@ -642,11 +735,41 @@ s:4/4
         assert_eq!(tab.systems[3].bars.len(), 2);
         assert_eq!(tab.systems[3].bars[0].voice_split, Some(2));
         assert_eq!(tab.systems[3].bars[1].voice_split, Some(5));
+        // The fifth example marks an arpeggiated chord: every note starts on
+        // the `~` in the first column, not on the fret number next to it. It
+        // has no marker of its own, so it keeps the single-voice split (`!`
+        // on the bottom string) from the fourth example.
+        assert_eq!(tab.systems[4].bars.len(), 1);
+        assert_eq!(tab.systems[4].bars[0].voice_split, Some(5));
+        assert_eq!(
+            tab.systems[4].bars[0].strings[0],
+            vec![StringEvent::Onset {
+                col: 1,
+                fret: 0,
+                arpeggio: true
+            }]
+        );
+        assert_eq!(
+            tab.systems[4].bars[0].strings[1],
+            vec![StringEvent::Onset {
+                col: 1,
+                fret: 1,
+                arpeggio: true
+            }]
+        );
+        assert_eq!(
+            tab.systems[4].bars[0].strings[2],
+            vec![StringEvent::Onset {
+                col: 1,
+                fret: 2,
+                arpeggio: true
+            }]
+        );
     }
 
     #[test]
     fn aura_lee() {
-        let tab = parse(include_str!("../aura_lee.tab")).unwrap();
+        let tab = parse(include_str!("../examples/aura_lee.tab")).unwrap();
         assert!(tab.warnings.is_empty(), "warnings: {:?}", tab.warnings);
         assert_eq!(tab.title.as_deref(), Some("Aura Lee"));
         assert_eq!(tab.composer.as_deref(), Some("Traditional"));
@@ -671,20 +794,47 @@ s:4/4
         // First system, first bar (C major): treble on the top three strings.
         let bar = &tab.systems[0].bars[0];
         assert_eq!(bar.voice_split, Some(2));
-        assert_eq!(bar.strings[2], vec![StringEvent::Onset { col: 1, fret: 0 }]);
+        assert_eq!(
+            bar.strings[2],
+            vec![StringEvent::Onset {
+                col: 1,
+                fret: 0,
+                arpeggio: false
+            }]
+        );
         assert_eq!(
             bar.strings[1],
             vec![
-                StringEvent::Onset { col: 5, fret: 1 },
-                StringEvent::Onset { col: 9, fret: 0 },
-                StringEvent::Onset { col: 11, fret: 1 }
+                StringEvent::Onset {
+                    col: 5,
+                    fret: 1,
+                    arpeggio: false
+                },
+                StringEvent::Onset {
+                    col: 9,
+                    fret: 0,
+                    arpeggio: false
+                },
+                StringEvent::Onset {
+                    col: 11,
+                    fret: 1,
+                    arpeggio: false
+                }
             ]
         );
         assert_eq!(
             bar.strings[4],
             vec![
-                StringEvent::Onset { col: 1, fret: 3 },
-                StringEvent::Onset { col: 9, fret: 3 }
+                StringEvent::Onset {
+                    col: 1,
+                    fret: 3,
+                    arpeggio: false
+                },
+                StringEvent::Onset {
+                    col: 9,
+                    fret: 3,
+                    arpeggio: false
+                }
             ]
         );
         assert!(bar.strings[5].is_empty());
@@ -704,9 +854,21 @@ s:4/4
         assert_eq!(
             bar.strings[1],
             vec![
-                StringEvent::Onset { col: 1, fret: 1 },
-                StringEvent::Onset { col: 5, fret: 1 },
-                StringEvent::Onset { col: 9, fret: 2 },
+                StringEvent::Onset {
+                    col: 1,
+                    fret: 1,
+                    arpeggio: false
+                },
+                StringEvent::Onset {
+                    col: 5,
+                    fret: 1,
+                    arpeggio: false
+                },
+                StringEvent::Onset {
+                    col: 9,
+                    fret: 2,
+                    arpeggio: false
+                },
                 StringEvent::Tie { col: 11 }
             ]
         );

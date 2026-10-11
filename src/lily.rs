@@ -111,6 +111,10 @@ fn write_staff(
             ("lower", Voice::Lower, "\\voiceTwo"),
         ] {
             out.push_str(&format!("        \\new {voice_ctx} = \"{name}\" {{\n"));
+            if tab_mode {
+                // Tab staves suppress arpeggios by default.
+                out.push_str("          \\override Arpeggio.stencil = #ly:arpeggio::print\n");
+            }
             out.push_str(&format!("          {command}\n"));
             let mut state = VoiceState::new();
             let piece = Piece {
@@ -130,6 +134,8 @@ fn write_staff(
         out.push_str(&format!("      \\new {staff} {{\n"));
         if !tab_mode {
             out.push_str("        \\clef \"treble_8\"\n");
+        } else {
+            out.push_str("        \\override Arpeggio.stencil = #ly:arpeggio::print\n");
         }
         let mut state = VoiceState::new();
         let piece = Piece {
@@ -179,7 +185,8 @@ struct Event {
     /// 0-based column within the system.
     abs: usize,
     bar: usize,
-    onsets: Vec<(usize, u8)>,
+    /// `(string, fret, arpeggiated)` per struck string.
+    onsets: Vec<(usize, u8, bool)>,
     ties: Vec<usize>,
     duration: usize,
 }
@@ -298,9 +305,11 @@ fn render_voice_system(
         }
 
         // Tied notes keep their spelling; onsets are spelled in the context
-        // of the active chord, falling back to the key.
+        // of the active chord, falling back to the key. An arpeggio mark is
+        // engraved in the tablature staff only.
         let mut notes: Vec<(usize, i32, String)> = tied;
-        for &(string, fret) in &event.onsets {
+        let arpeggio = tab_mode && event.onsets.iter().any(|&(_, _, arp)| arp);
+        for &(string, fret, _) in &event.onsets {
             let midi = tab.tuning.open_midi[string] + fret as i32;
             let chord_map = active_chord(system, event.bar, col_of(event.abs, event.bar, width))
                 .map(|chord| chord_spelling_map(chord.root, chord.qual));
@@ -332,7 +341,13 @@ fn render_voice_system(
                 if i > 0 {
                     push_tie(&mut tokens);
                 }
-                tokens.push(format!("{pitch_text}{}{string_suffix}", dur.to_lily()));
+                let mut token = format!("{pitch_text}{}{string_suffix}", dur.to_lily());
+                // The arpeggio marks the attack, so only the first of a
+                // chain of tied notes carries it.
+                if arpeggio && i == 0 {
+                    token.push_str("\\arpeggio");
+                }
+                tokens.push(token);
             }
             for &(string, midi, ref name) in &notes {
                 state.strings[string] = Some(StringState {
@@ -378,12 +393,16 @@ fn build_events(
         for string in 0..STRING_COUNT {
             for event in &system.bars[bar].strings[string] {
                 match *event {
-                    StringEvent::Onset { col, fret } => {
+                    StringEvent::Onset {
+                        col,
+                        fret,
+                        arpeggio,
+                    } => {
                         if in_voice(voice, voice_split_at(&system.bars[bar], col), string) {
                             raw.push(Event {
                                 abs: bar * width + col - 1,
                                 bar,
-                                onsets: vec![(string, fret)],
+                                onsets: vec![(string, fret, arpeggio)],
                                 ties: Vec::new(),
                                 duration: 0,
                             });
@@ -449,7 +468,7 @@ fn build_events(
         // A string that starts a new note here cannot also be tied.
         event
             .ties
-            .retain(|string| !event.onsets.iter().any(|(onset, _)| onset == string));
+            .retain(|string| !event.onsets.iter().any(|(onset, _, _)| onset == string));
     }
     for i in 0..events.len() {
         let bar_end = (events[i].bar + 1) * width;
@@ -743,7 +762,7 @@ s:4/4
 
     #[test]
     fn aura_lee_lilypond() {
-        let tab = parse(include_str!("../aura_lee.tab")).unwrap();
+        let tab = parse(include_str!("../examples/aura_lee.tab")).unwrap();
         assert!(tab.warnings.is_empty(), "warnings: {:?}", tab.warnings);
         let (lilypond, warnings) = generate(&tab);
         assert!(warnings.is_empty(), "warnings: {warnings:?}");
@@ -794,9 +813,11 @@ s:4/4
             lilypond
                 .contains("<g\\3 cis'\\2 f'\\1>8~ <g\\3 cis'\\2 e'\\1>8~ <g\\3 cis'\\2 e'\\1>4 |")
         );
-        assert!(lilypond.contains("<c\\5 e\\4 g\\3 c'\\2>1 | \\bar \"||\""));
+        assert!(lilypond.contains("<c\\5 e\\4 g\\3 c'\\2>1\\arpeggio | \\bar \"||\""));
         assert!(lilypond.contains("c'4\\2 b4\\2 a8\\3 b8\\2~ b4\\2 |"));
         assert!(lilypond.contains("g,4\\6 d4\\4 g,4\\6 d4\\4 |"));
+        // Tab staves re-enable arpeggio printing.
+        assert!(lilypond.contains("\\override Arpeggio.stencil = #ly:arpeggio::print"));
         // The `.` in the eighth column of the second system's third bar moves
         // the split to the third string: the G string joins the treble voice
         // from the next note on.
@@ -804,6 +825,33 @@ s:4/4
         assert!(lilypond.contains("f4 a4 g,4 d4 |"));
         assert!(lilypond.contains("<c'\\2 e'\\1>4 d'4\\2 <g\\3 c'\\2>8 d'8\\2~ d'8\\2 e'8\\1~ |"));
         assert!(lilypond.contains("f4\\4 a4\\3 g,4\\6 d4\\4 |"));
+    }
+
+    #[test]
+    fn arpeggio_lilypond() {
+        // The fifth README example: `~` before a fret number marks an
+        // arpeggiated note that starts on the `~`'s column.
+        let tab = parse(
+            "\
+s:4/4
+--
+|~0--------------|
+|~1--------------|
+|~2--------------|
+|----------------|
+|----------------|
+|----------------|
+",
+        )
+        .unwrap();
+        assert!(tab.warnings.is_empty(), "warnings: {:?}", tab.warnings);
+        let (lilypond, warnings) = generate(&tab);
+        assert!(warnings.is_empty(), "warnings: {warnings:?}");
+        // The chord starts on the first column (a whole note), and the
+        // arpeggio is engraved in the tablature staff only.
+        assert!(lilypond.contains("<a c' e'>1 |"));
+        assert!(lilypond.contains("<a\\3 c'\\2 e'\\1>1\\arpeggio |"));
+        assert!(lilypond.contains("\\override Arpeggio.stencil = #ly:arpeggio::print"));
     }
 
     #[test]

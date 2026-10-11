@@ -73,7 +73,29 @@ should be notated with invisible rests (like the second bar in this example):
 |3-------3-------!----------------|
 ~~~
 
+Arpeggios
+---------
 
+A `~` immediately before a fret number marks an arpeggiated note. The note
+starts on the column of the `~` itself, not on the column of the number,
+which only labels the fret. Arpeggiated notes are engraved with an arpeggio
+(a wavy line across the chord) in the tablature staff:
+
+~~~tab
+s:4/4
+--
+|~0--------------|
+|~1--------------|
+|~2--------------|
+|----------------|
+|----------------|
+|----------------|
+~~~
+
+Here the chord starts on the first column even though the fret numbers sit
+in the second, so it is engraved as a whole note with an arpeggio.
+
+ 
 ## Usage
 
 The tab is read from the file given on the command line (or standard input
@@ -84,7 +106,7 @@ string number, so the frets shown are exactly the ones in the tab rather
 than a fingering guessed by LilyPond.  Warnings about ignored or unsupported
 input go to standard error:
 
-    cargo run -- aura_lee.tab > aura_lee.ly
+    cargo run -- examples/aura_lee.tab > aura_lee.ly
     lilypond aura_lee.ly
 
 The fenced example above can be converted directly from this README:
