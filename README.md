@@ -9,6 +9,40 @@ voices and to add extra details on the timings of each note.
 
 Note timings come from the horizontal spacing (couple with the time signature).
 
+Basics
+------
+
+Bars are marked with `|` characters, strings with a `-` and numerals for fret
+numbers. Horizontal spacing marks the timing of each note and can be any number
+of characters wide (providing it can divide nicely into the time signature).
+Lines whose first character is `#` are comments; they are ignored entirely and
+can appear anywhere, even between the lines of a system.
+
+This example shows four identical bars with different widths.
+
+~~~tab
+{signature:4/4}
+|----|--------|----------------|--------------------------------|
+|---6|------6-|------------6---|------------------------6-------|
+|--5-|----5---|--------5-------|----------------5---------------|
+|-7--|--7-----|----7-----------|--------7-----------------------|
+|8---|8-------|8---------------|8-------------------------------|
+|----|--------|----------------|--------------------------------|
+~~~
+
+Each bar holds the same four crotchets; the wider the bar, the more
+characters each crotchet takes.
+
+Header
+------
+
+Metadata is written as ChordPro-style `{key:value}` directives before the tab
+systems, and no separator is needed between the header and the music. The
+recognised keys are `title`, `composer`, `arranger`, `key`, `signature`
+(shorthand `s`) and `tuning`.
+
+
+
 Voices
 ------
 
@@ -19,8 +53,7 @@ and a minim and the treble voice is . The treble voice is a quaver, followed by
 three pairs of tied quavers and a final quaver:
 
 ~~~tab
-s:4/4
---
+{signature:4/4}
 |----------2---5-|
 |------4---------|
 |--2-------------|
@@ -37,8 +70,7 @@ crotchet and a melody line on each quaver which uses the same string used for
 parts of the bass voice:
 
 ~~~tab
-s:4/4
---
+{signature:4/4}
 |----------------|
 |--------------2-|
 !2-4---2---2-4---|
@@ -82,8 +114,7 @@ which only labels the fret. Arpeggiated notes are engraved with an arpeggio
 (a wavy line across the chord) in the tablature staff:
 
 ~~~tab
-s:4/4
---
+{signature:4/4}
 |~0--------------|
 |~1--------------|
 |~2--------------|

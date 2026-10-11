@@ -2,10 +2,13 @@
 //!
 //! The format is "natural" ASCII tab enriched with a few markers:
 //!
-//! * `s:4/4` (or `signature:4/4`) sets the time signature for the following
-//!   systems,
-//! * lines of only dashes separate metadata from tab (or systems from each
-//!   other),
+//! * `{key:value}` directives (ChordPro style) set metadata for the
+//!   following systems: `title`, `composer`, `arranger`, `key`, `signature`
+//!   (shorthand `s`) and `tuning`; no separator is needed between the
+//!   header and the music,
+//! * a `#` preceded by whitespace starts a comment running to the end of
+//!   the line (except inside `{...}` directives), and a line starting with
+//!   `#` is a comment too; comments are ignored entirely,
 //! * a system is six string lines, the top line being the high E string,
 //! * each bar is `|`/`!` followed by the bar content and closed by `|`, `:|`
 //!   (repeat) or `||` (double barline),
@@ -52,6 +55,9 @@ pub struct ChordSlot {
 #[derive(Debug)]
 pub struct Bar {
     pub width: usize,
+    /// Music-time position of the bar's first column within its system:
+    /// the sum of the widths of the preceding bars.
+    pub start: usize,
     /// The split in force at the start of the bar: an explicit `!` or the
     /// split carried over from the previous bar. `None` means no voice has
     /// ever been separated: all strings are one (treble) voice.
@@ -149,6 +155,11 @@ impl Parser {
             self.flush_system();
             return;
         }
+        if trimmed.starts_with('#') {
+            // Full-line comments are ignored entirely; they do not end a
+            // system.
+            return;
+        }
         if is_fence(trimmed) {
             return;
         }
@@ -161,15 +172,16 @@ impl Parser {
             if self.tab_lines.len() == 6 {
                 self.flush_system();
             }
-            self.tab_lines.push((lineno, line.to_string()));
+            self.tab_lines
+                .push((lineno, strip_comment(line).trim_end().to_string()));
             return;
         }
         self.flush_system();
-        if let Some((key, value)) = metadata(trimmed) {
+        if let Some((key, value)) = metadata(strip_comment(trimmed).trim()) {
             self.metadata(lineno, &key, &value);
             return;
         }
-        if let Some(tokens) = chord_tokens(line) {
+        if let Some(tokens) = chord_tokens(strip_comment(line)) {
             if !self.pending_chords.is_empty() {
                 self.warn(
                     lineno,
@@ -240,11 +252,18 @@ impl Parser {
             return;
         };
         let n_bars = parsed[0].1.len();
-        let width = parsed[0].1.first().map_or(0, String::len);
+        // Bars may be any width (as long as it divides into the time
+        // signature); each bar's width must however be the same on every
+        // string line.
+        let widths: Vec<usize> = parsed[0].1.iter().map(String::len).collect();
         let consistent = n_bars > 0
-            && width > 0
+            && widths.iter().all(|&width| width > 0)
             && parsed.iter().all(|(_, chunks, _)| {
-                chunks.len() == n_bars && chunks.iter().all(|c| c.len() == width)
+                chunks.len() == n_bars
+                    && chunks
+                        .iter()
+                        .zip(&widths)
+                        .all(|(chunk, &width)| chunk.len() == width)
             });
         if !consistent {
             self.warn(lineno, "inconsistent bar widths in tab system; skipped");
@@ -255,7 +274,8 @@ impl Parser {
             self.warn(lineno, "inconsistent closing barlines; using the first");
         }
         let mut bars = Vec::with_capacity(n_bars);
-        for b in 0..n_bars {
+        let mut start = 0usize;
+        for (b, &width) in widths.iter().enumerate() {
             let bangs: Vec<usize> = (0..6).filter(|&s| parsed[s].0[b] == '!').collect();
             if bangs.len() > 1 {
                 self.warn(lineno, "multiple voice markers in one bar; using the first");
@@ -285,12 +305,14 @@ impl Parser {
             }
             bars.push(Bar {
                 width,
+                start,
                 voice_split,
                 split_changes,
                 strings,
             });
+            start += width;
         }
-        let chords = self.resolve_chords(lineno, n_bars, width);
+        let chords = self.resolve_chords(lineno, &widths);
         self.tab.systems.push(System {
             time_sig: self.time_sig,
             bars,
@@ -356,22 +378,22 @@ impl Parser {
     }
 
     /// Map the pending chord symbols onto bars using the system's grid.
-    fn resolve_chords(&mut self, lineno: usize, n_bars: usize, width: usize) -> Vec<ChordSlot> {
+    fn resolve_chords(&mut self, lineno: usize, widths: &[usize]) -> Vec<ChordSlot> {
         let tokens = std::mem::take(&mut self.pending_chords);
         if tokens.is_empty() {
             return Vec::new();
         }
-        let stride = width + 1;
-        let beat = if width.is_multiple_of(self.time_sig.num as usize) {
-            width / self.time_sig.num as usize
-        } else {
-            self.warn(
-                lineno,
-                "bar width is not a multiple of the beat count; chord positions not snapped",
-            );
-            0
-        };
+        let n_bars = widths.len();
+        // Line column of each bar's leading barline character.
+        let mut starts = Vec::with_capacity(n_bars);
+        let mut linepos = 0usize;
+        for &width in widths {
+            starts.push(linepos);
+            linepos += width + 1;
+        }
         let mut slots = Vec::new();
+        let mut bar = 0usize;
+        let mut warned_no_snap = false;
         for (linecol, token) in tokens {
             let Some(chord) = music::parse_chord(&token) else {
                 self.warn(
@@ -380,26 +402,35 @@ impl Parser {
                 );
                 continue;
             };
-            // Content column c of bar i sits at line column 1 + i * stride + c.
-            let (bar, mut col) = if linecol < 2 {
-                (0, 1)
-            } else {
-                let bar = (linecol - 2) / stride;
-                let col = linecol - 1 - bar * stride;
-                (bar, col)
-            };
-            if bar >= n_bars {
+            // Advance to the bar whose content this column falls in.
+            while bar + 1 < n_bars && linecol > starts[bar] + 1 + widths[bar] {
+                bar += 1;
+            }
+            let mut col = (linecol - starts[bar] - 1).max(1);
+            if col > widths[bar] {
                 self.warn(
                     lineno,
                     format!("chord symbol {token:?} lies beyond the tab system; ignored"),
                 );
                 continue;
             }
+            let beat = if widths[bar].is_multiple_of(self.time_sig.num as usize) {
+                widths[bar] / self.time_sig.num as usize
+            } else {
+                if !warned_no_snap {
+                    self.warn(
+                        lineno,
+                        "bar width is not a multiple of the beat count; chord positions not snapped",
+                    );
+                    warned_no_snap = true;
+                }
+                0
+            };
             if let Some(k) = (col - 1).checked_div(beat) {
                 // Chord symbols are hand aligned; snap to the nearest beat.
                 let lower = 1 + k * beat;
                 let upper = 1 + (k + 1) * beat;
-                if upper <= width && upper - col < col - lower {
+                if upper <= widths[bar] && upper - col < col - lower {
                     col = upper;
                 } else {
                     col = lower;
@@ -450,8 +481,30 @@ fn is_tab_line(line: &str) -> bool {
 }
 
 /// A `key: value` metadata line.
+/// The line up to the first comment: a `#` preceded by whitespace, unless
+/// it sits inside a `{...}` directive (so values may contain `#`). A `#`
+/// glued to earlier text — such as the sharp in a chord symbol — is left
+/// alone.
+fn strip_comment(line: &str) -> &str {
+    let mut depth = 0usize;
+    let mut after_space = true;
+    for (i, ch) in line.char_indices() {
+        match ch {
+            '{' => depth += 1,
+            '}' => depth = depth.saturating_sub(1),
+            '#' if depth == 0 && after_space => return &line[..i],
+            _ => {}
+        }
+        after_space = ch.is_whitespace();
+    }
+    line
+}
+
+/// A ChordPro-style `{key:value}` directive.
 fn metadata(line: &str) -> Option<(String, String)> {
-    let (key, value) = line.split_once(':')?;
+    let inner = line.strip_prefix('{')?.strip_suffix('}')?;
+    let (key, value) = inner.split_once(':')?;
+    let key = key.trim();
     if key.is_empty() || !key.chars().all(|c| c.is_ascii_alphanumeric()) {
         return None;
     }
@@ -603,8 +656,7 @@ mod tests {
     use crate::music::{Qual, Spelling};
 
     const README_EXAMPLE: &str = "\
-s:4/4
---
+{signature:4/4}
 |----------2---5-|
 |------4---------|
 |--2-------------|
@@ -697,16 +749,87 @@ s:4/4
     }
 
     #[test]
+    fn comments_are_ignored() {
+        // Comments may appear anywhere, even between the lines of a system,
+        // and are ignored entirely.
+        let tab = parse(
+            "\
+# a header comment
+{signature:4/4}
+|0---------------|
+# an inline comment
+|----------------|
+|----------------|
+|----------------|
+|----------------|
+|----------------|
+   # an indented comment
+|0---------------|0---------------|
+|----------------|----------------|
+|----------------|----------------|
+|----------------|----------------|
+|----------------|----------------|
+|----------------|----------------|
+# a trailing comment
+",
+        )
+        .unwrap();
+        assert!(tab.warnings.is_empty(), "warnings: {:?}", tab.warnings);
+        assert_eq!(tab.systems.len(), 2);
+        assert_eq!(
+            tab.systems[0].bars[0].strings[0],
+            vec![StringEvent::Onset {
+                col: 1,
+                fret: 0,
+                arpeggio: false
+            }]
+        );
+        assert_eq!(tab.systems[1].bars.len(), 2);
+        assert!(tab.systems[1].bars[1].strings[5].is_empty());
+    }
+
+    #[test]
     fn readme_md_itself_parses() {
-        // All five fenced examples inside README.md should be found.
+        // All six fenced examples inside README.md should be found.
         let tab = parse(include_str!("../README.md")).unwrap();
-        assert_eq!(tab.systems.len(), 5);
-        assert_eq!(tab.systems[0].bars.len(), 1);
+        assert_eq!(tab.systems.len(), 6);
+        // The first example shows the same music in bars of four different
+        // widths.
+        assert_eq!(tab.systems[0].bars.len(), 4);
         assert_eq!(tab.systems[0].time_sig, TimeSig { num: 4, den: 4 });
-        // The second example splits at the third string and moves the split
-        // to the fourth string with a `.` in the eighth column.
+        let widths: Vec<usize> = tab.systems[0].bars.iter().map(|b| b.width).collect();
+        assert_eq!(widths, vec![4, 8, 16, 32]);
+        assert_eq!(tab.systems[0].bars[0].voice_split, None);
+        assert_eq!(
+            tab.systems[0].bars[0].strings[4],
+            vec![StringEvent::Onset {
+                col: 1,
+                fret: 8,
+                arpeggio: false
+            }]
+        );
+        assert_eq!(
+            tab.systems[0].bars[1].strings[1],
+            vec![StringEvent::Onset {
+                col: 7,
+                fret: 6,
+                arpeggio: false
+            }]
+        );
+        assert_eq!(
+            tab.systems[0].bars[3].strings[2],
+            vec![StringEvent::Onset {
+                col: 17,
+                fret: 5,
+                arpeggio: false
+            }]
+        );
         assert_eq!(tab.systems[1].bars.len(), 1);
-        let bar = &tab.systems[1].bars[0];
+        assert_eq!(tab.systems[1].time_sig, TimeSig { num: 4, den: 4 });
+        // The third example splits at the third string and moves the split
+        // to the fourth string with a `.` in the eighth column.
+        assert_eq!(tab.systems[2].bars.len(), 1);
+        let bar = &tab.systems[2].bars[0];
         assert_eq!(bar.voice_split, Some(2));
         assert_eq!(bar.split_changes, vec![(8, 3)]);
         assert_eq!(
@@ -724,25 +847,25 @@ s:4/4
                 },
             ]
         );
-        // The third example has no metadata (defaulting to 4/4) and no
+        // The fourth example has no metadata (defaulting to 4/4) and no
         // marker on its second bar, which keeps the first bar's split.
-        assert_eq!(tab.systems[2].bars.len(), 2);
-        assert_eq!(tab.systems[2].time_sig, TimeSig { num: 4, den: 4 });
-        assert_eq!(tab.systems[2].bars[0].voice_split, Some(2));
-        assert_eq!(tab.systems[2].bars[1].voice_split, Some(2));
-        // The fourth example marks its second bar single voice with a `!` on
-        // the bottom string.
         assert_eq!(tab.systems[3].bars.len(), 2);
+        assert_eq!(tab.systems[3].time_sig, TimeSig { num: 4, den: 4 });
         assert_eq!(tab.systems[3].bars[0].voice_split, Some(2));
-        assert_eq!(tab.systems[3].bars[1].voice_split, Some(5));
-        // The fifth example marks an arpeggiated chord: every note starts on
+        assert_eq!(tab.systems[3].bars[1].voice_split, Some(2));
+        // The fifth example marks its second bar single voice with a `!` on
+        // the bottom string.
+        assert_eq!(tab.systems[4].bars.len(), 2);
+        assert_eq!(tab.systems[4].bars[0].voice_split, Some(2));
+        assert_eq!(tab.systems[4].bars[1].voice_split, Some(5));
+        // The sixth example marks an arpeggiated chord: every note starts on
         // the `~` in the first column, not on the fret number next to it. It
         // has no marker of its own, so it keeps the single-voice split (`!`
-        // on the bottom string) from the fourth example.
-        assert_eq!(tab.systems[4].bars.len(), 1);
-        assert_eq!(tab.systems[4].bars[0].voice_split, Some(5));
+        // on the bottom string) from the fifth example.
+        assert_eq!(tab.systems[5].bars.len(), 1);
+        assert_eq!(tab.systems[5].bars[0].voice_split, Some(5));
         assert_eq!(
-            tab.systems[4].bars[0].strings[0],
+            tab.systems[5].bars[0].strings[0],
             vec![StringEvent::Onset {
                 col: 1,
                 fret: 0,
@@ -750,7 +873,7 @@ s:4/4
             }]
         );
         assert_eq!(
-            tab.systems[4].bars[0].strings[1],
+            tab.systems[5].bars[0].strings[1],
             vec![StringEvent::Onset {
                 col: 1,
                 fret: 1,
@@ -758,7 +881,7 @@ s:4/4
             }]
         );
         assert_eq!(
-            tab.systems[4].bars[0].strings[2],
+            tab.systems[5].bars[0].strings[2],
             vec![StringEvent::Onset {
                 col: 1,
                 fret: 2,

@@ -240,11 +240,23 @@ fn render_voice_system(
     let key_map = piece.key_map;
     let tab_mode = piece.tab_mode;
     let last_system = tab.systems.len() - 1;
-    let width = system.bars[0].width;
     let n_bars = system.bars.len();
-    let unit = system.time_sig.bar_len() / Rational::integer(width as i64);
-    let beat_cols = beat_columns(system);
-    let events = build_events(system, voice, width, warnings);
+    // Each bar may have its own width, so the time value of one column and
+    // the beat positions are per bar.
+    let timings: Vec<(Rational, usize)> = system
+        .bars
+        .iter()
+        .map(|bar| {
+            let unit = system.time_sig.bar_len() / Rational::integer(bar.width as i64);
+            let beat_cols = if bar.width.is_multiple_of(system.time_sig.num as usize) {
+                bar.width / system.time_sig.num as usize
+            } else {
+                0
+            };
+            (unit, beat_cols)
+        })
+        .collect();
+    let events = build_events(system, voice, warnings);
     // A bar in which this voice has no notes at all is filled with invisible
     // rests (skips): the README specifies this for bars where every note
     // belongs to the other voice.
@@ -276,13 +288,18 @@ fn render_voice_system(
         let mut tie_pending = !tied.is_empty();
 
         // Close any bars that end before this event.
-        while bar < n_bars && (bar + 1) * width <= event.abs {
-            let bar_end = (bar + 1) * width;
+        while bar < n_bars && system.bars[bar].start + system.bars[bar].width <= event.abs {
+            let bar_end = system.bars[bar].start + system.bars[bar].width;
             if pos < bar_end {
                 let prefix = if voiced[bar] { 'r' } else { 's' };
                 tokens.extend(filler(
                     prefix,
-                    &note_durs(col_of(pos, bar, width), bar_end - pos, beat_cols, unit),
+                    &note_durs(
+                        col_of(pos, &system.bars[bar]),
+                        bar_end - pos,
+                        timings[bar].1,
+                        timings[bar].0,
+                    ),
                 ));
             }
             pos = bar_end;
@@ -297,7 +314,12 @@ fn render_voice_system(
         if event.abs > pos {
             tokens.extend(filler(
                 'r',
-                &note_durs(col_of(pos, bar, width), event.abs - pos, beat_cols, unit),
+                &note_durs(
+                    col_of(pos, &system.bars[bar]),
+                    event.abs - pos,
+                    timings[bar].1,
+                    timings[bar].0,
+                ),
             ));
         }
         if tie_pending {
@@ -311,8 +333,12 @@ fn render_voice_system(
         let arpeggio = tab_mode && event.onsets.iter().any(|&(_, _, arp)| arp);
         for &(string, fret, _) in &event.onsets {
             let midi = tab.tuning.open_midi[string] + fret as i32;
-            let chord_map = active_chord(system, event.bar, col_of(event.abs, event.bar, width))
-                .map(|chord| chord_spelling_map(chord.root, chord.qual));
+            let chord_map = active_chord(
+                system,
+                event.bar,
+                col_of(event.abs, &system.bars[event.bar]),
+            )
+            .map(|chord| chord_spelling_map(chord.root, chord.qual));
             let name = lily_note_name(midi, spell(midi, chord_map.as_ref(), key_map));
             notes.push((string, midi, name));
         }
@@ -323,19 +349,19 @@ fn render_voice_system(
             tokens.extend(filler(
                 'r',
                 &note_durs(
-                    col_of(event.abs, event.bar, width),
+                    col_of(event.abs, &system.bars[event.bar]),
                     event.duration,
-                    beat_cols,
-                    unit,
+                    timings[event.bar].1,
+                    timings[event.bar].0,
                 ),
             ));
         } else {
             let (pitch_text, string_suffix) = chord_text(&notes, tab_mode);
             let durs = note_durs(
-                col_of(event.abs, event.bar, width),
+                col_of(event.abs, &system.bars[event.bar]),
                 event.duration,
-                beat_cols,
-                unit,
+                timings[event.bar].1,
+                timings[event.bar].0,
             );
             for (i, dur) in durs.iter().enumerate() {
                 if i > 0 {
@@ -363,12 +389,17 @@ fn render_voice_system(
 
     // Close any bars after the last event.
     while bar < n_bars {
-        let bar_end = (bar + 1) * width;
+        let bar_end = system.bars[bar].start + system.bars[bar].width;
         if pos < bar_end {
             let prefix = if voiced[bar] { 'r' } else { 's' };
             tokens.extend(filler(
                 prefix,
-                &note_durs(col_of(pos, bar, width), bar_end - pos, beat_cols, unit),
+                &note_durs(
+                    col_of(pos, &system.bars[bar]),
+                    bar_end - pos,
+                    timings[bar].1,
+                    timings[bar].0,
+                ),
             ));
         }
         pos = bar_end;
@@ -381,12 +412,7 @@ fn render_voice_system(
 
 /// Build a voice's event timeline for one system, merging simultaneous
 /// events and computing durations.
-fn build_events(
-    system: &System,
-    voice: Voice,
-    width: usize,
-    warnings: &mut Vec<String>,
-) -> Vec<Event> {
+fn build_events(system: &System, voice: Voice, warnings: &mut Vec<String>) -> Vec<Event> {
     let n_bars = system.bars.len();
     let mut raw: Vec<Event> = Vec::new();
     for bar in 0..n_bars {
@@ -400,7 +426,7 @@ fn build_events(
                     } => {
                         if in_voice(voice, voice_split_at(&system.bars[bar], col), string) {
                             raw.push(Event {
-                                abs: bar * width + col - 1,
+                                abs: system.bars[bar].start + col - 1,
                                 bar,
                                 onsets: vec![(string, fret, arpeggio)],
                                 ties: Vec::new(),
@@ -422,9 +448,9 @@ fn build_events(
                                     string,
                                 ) {
                                     let abs = if source_bar < bar {
-                                        bar * width
+                                        system.bars[bar].start
                                     } else {
-                                        bar * width + col - 1
+                                        system.bars[bar].start + col - 1
                                     };
                                     raw.push(Event {
                                         abs,
@@ -471,7 +497,8 @@ fn build_events(
             .retain(|string| !event.onsets.iter().any(|(onset, _, _)| onset == string));
     }
     for i in 0..events.len() {
-        let bar_end = (events[i].bar + 1) * width;
+        let bar = &system.bars[events[i].bar];
+        let bar_end = bar.start + bar.width;
         let next = events.get(i + 1).map_or(bar_end, |event| event.abs);
         events[i].duration = next.min(bar_end) - events[i].abs;
     }
@@ -519,19 +546,8 @@ fn in_voice(voice: Voice, split: Option<usize>, string: usize) -> bool {
     }
 }
 
-/// Length of one beat in columns, or zero when the grid does not divide
-/// evenly into beats.
-fn beat_columns(system: &System) -> usize {
-    let width = system.bars[0].width;
-    if width.is_multiple_of(system.time_sig.num as usize) {
-        width / system.time_sig.num as usize
-    } else {
-        0
-    }
-}
-
-fn col_of(abs: usize, bar: usize, width: usize) -> usize {
-    abs - bar * width + 1
+fn col_of(abs: usize, bar: &Bar) -> usize {
+    abs - bar.start + 1
 }
 
 /// The chord symbol sounding at (`bar`, `col`), if any.
@@ -630,18 +646,22 @@ fn chord_lines(tab: &Tab) -> Vec<String> {
     let mut lines = Vec::new();
     let last_system = tab.systems.len() - 1;
     for (si, system) in tab.systems.iter().enumerate() {
-        let width = system.bars[0].width;
-        let unit = system.time_sig.bar_len() / Rational::integer(width as i64);
-        let beat_cols = beat_columns(system);
         let mut slots: Vec<(usize, &Chord)> = system
             .chords
             .iter()
-            .map(|slot| (slot.bar * width + slot.col - 1, &slot.chord))
+            .map(|slot| (system.bars[slot.bar].start + slot.col - 1, &slot.chord))
             .collect();
         slots.sort_by_key(|&(abs, _)| abs);
         for bar in 0..system.bars.len() {
-            let start = bar * width;
-            let end = start + width;
+            let bar_ref = &system.bars[bar];
+            let start = bar_ref.start;
+            let end = start + bar_ref.width;
+            let unit = system.time_sig.bar_len() / Rational::integer(bar_ref.width as i64);
+            let beat_cols = if bar_ref.width.is_multiple_of(system.time_sig.num as usize) {
+                bar_ref.width / system.time_sig.num as usize
+            } else {
+                0
+            };
             let mut tokens: Vec<String> = Vec::new();
             let mut pos = start;
             for (i, &(abs, chord)) in slots.iter().enumerate() {
@@ -654,7 +674,7 @@ fn chord_lines(tab: &Tab) -> Vec<String> {
                 if abs > pos {
                     tokens.extend(filler(
                         's',
-                        &note_durs(col_of(pos, bar, width), abs - pos, beat_cols, unit),
+                        &note_durs(col_of(pos, bar_ref), abs - pos, beat_cols, unit),
                     ));
                 }
                 let next = slots
@@ -662,7 +682,7 @@ fn chord_lines(tab: &Tab) -> Vec<String> {
                     .map_or(end, |&(next, _)| next)
                     .min(end)
                     .max(abs + 1);
-                let durs = note_durs(col_of(abs, bar, width), next - abs, beat_cols, unit);
+                let durs = note_durs(col_of(abs, bar_ref), next - abs, beat_cols, unit);
                 for (di, dur) in durs.iter().enumerate() {
                     if di > 0 {
                         push_tie(&mut tokens);
@@ -674,7 +694,7 @@ fn chord_lines(tab: &Tab) -> Vec<String> {
             if pos < end {
                 tokens.extend(filler(
                     's',
-                    &note_durs(col_of(pos, bar, width), end - pos, beat_cols, unit),
+                    &note_durs(col_of(pos, bar_ref), end - pos, beat_cols, unit),
                 ));
             }
             let suffix = if bar + 1 == system.bars.len() && si != last_system {
@@ -695,8 +715,7 @@ mod tests {
     use super::generate;
 
     const README_EXAMPLE: &str = "\
-s:4/4
---
+{signature:4/4}
 |----------2---5-|
 |------4---------|
 |--2-------------|
@@ -738,8 +757,7 @@ s:4/4
     fn single_voice_lilypond() {
         let tab = parse(
             "\
-s:4/4
---
+{signature:4/4}
 |0-------5-------|
 |----------------|
 |----------------|
@@ -828,13 +846,38 @@ s:4/4
     }
 
     #[test]
+    fn mixed_width_lilypond() {
+        // The first README example: the same four crotchets written in bars
+        // of four different widths.
+        let tab = parse(
+            "\
+{signature:4/4}
+|----|--------|----------------|--------------------------------|
+|---6|------6-|------------6---|------------------------6-------|
+|--5-|----5---|--------5-------|----------------5---------------|
+|-7--|--7-----|----7-----------|--------7-----------------------|
+|8---|8-------|8---------------|8-------------------------------|
+|----|--------|----------------|--------------------------------|
+",
+        )
+        .unwrap();
+        assert!(tab.warnings.is_empty(), "warnings: {:?}", tab.warnings);
+        let (lilypond, warnings) = generate(&tab);
+        assert!(warnings.is_empty(), "warnings: {warnings:?}");
+        // Every bar holds the same four crotchet notes however wide it is.
+        let bar = "f4 a4 c'4 f'4 |";
+        assert_eq!(lilypond.matches(bar).count(), 4);
+        let tab_bar = "f4\\5 a4\\4 c'4\\3 f'4\\2 |";
+        assert_eq!(lilypond.matches(tab_bar).count(), 4);
+    }
+
+    #[test]
     fn arpeggio_lilypond() {
         // The fifth README example: `~` before a fret number marks an
         // arpeggiated note that starts on the `~`'s column.
         let tab = parse(
             "\
-s:4/4
---
+{signature:4/4}
 |~0--------------|
 |~1--------------|
 |~2--------------|
@@ -860,8 +903,7 @@ s:4/4
         // the `.` moves it to the fourth string from the eighth column on.
         let tab = parse(
             "\
-s:4/4
---
+{signature:4/4}
 |----------------|
 |--------------2-|
 !2-4---2---2-4---|
@@ -921,8 +963,7 @@ s:4/4
         // treble and the bass gets invisible rests.
         let tab = parse(
             "\
-s:4/4
---
+{signature:4/4}
 |----------------|----------------|
 |1---0-----0-----|1---------------|
 !--------2-------|0---------------|
