@@ -12,6 +12,9 @@
 //! * `|:` in place of a barline starts a repeated section and `:|` ends
 //!   one; a `:|` without a matching `|:` repeats from the previous `:|`
 //!   (or from the beginning),
+//! * a line above a system made of `+` markers and digits marks volta
+//!   endings: a `+N` sitting on a barline starts ending N there and the
+//!   ending runs to the next `+` (or the end of the line),
 //! * a system is six string lines, the top line being the high E string,
 //! * each bar is `|`/`!` followed by the bar content and closed by `|`, `:|`
 //!   (repeat) or `||` (double barline),
@@ -67,6 +70,10 @@ pub struct Bar {
     pub repeat_start: bool,
     /// The barline closing the bar: `|`, `||` or `:|`.
     pub close: Barline,
+    /// The volta ending (alternative) number this bar belongs to, from a
+    /// `+N` marker on an endings line above the system. `None` means the
+    /// bar is part of the repeat body (or of plain music).
+    pub ending: Option<usize>,
     /// The split in force at the start of the bar: an explicit `!` or the
     /// split carried over from the previous bar. `None` means no voice has
     /// ever been separated: all strings are one (treble) voice.
@@ -116,6 +123,8 @@ pub enum Barline {
 struct ParsedBar {
     /// The leading barline: `!` marks a voice split for this bar.
     marker: char,
+    /// 0-based column of the bar's leading barline character.
+    marker_col: usize,
     /// The bar starts a repeated section (`|:`).
     repeat_start: bool,
     content: String,
@@ -139,6 +148,7 @@ pub fn parse(input: &str) -> Result<Tab, String> {
         time_sig: TimeSig { num: 4, den: 4 },
         voice_split: None,
         pending_chords: Vec::new(),
+        pending_endings: Vec::new(),
         tab_lines: Vec::new(),
         unknown_chars: HashSet::new(),
     };
@@ -155,6 +165,8 @@ struct Parser {
     /// and carried over every later bar, including bars on later lines.
     voice_split: Option<usize>,
     pending_chords: Vec<(usize, String)>,
+    /// `(column, number)` markers from a pending volta endings line.
+    pending_endings: Vec<(usize, usize)>,
     tab_lines: Vec<(usize, String)>,
     unknown_chars: HashSet<char>,
 }
@@ -191,6 +203,26 @@ impl Parser {
             }
             self.tab_lines
                 .push((lineno, strip_comment(line).trim_end().to_string()));
+            return;
+        }
+        if let Some(markers) = parse_endings_line(strip_comment(line)) {
+            // A volta endings line belongs to the system below it, like a
+            // chord line.
+            self.flush_system();
+            if markers.is_empty() {
+                self.warn(
+                    lineno,
+                    "volta endings line without an ending number; ignored",
+                );
+            } else {
+                if !self.pending_endings.is_empty() {
+                    self.warn(
+                        lineno,
+                        "volta endings without a following tab system; replaced",
+                    );
+                }
+                self.pending_endings = markers;
+            }
             return;
         }
         self.flush_system();
@@ -297,6 +329,7 @@ impl Parser {
         {
             self.warn(lineno, "inconsistent closing barlines; using the first");
         }
+        let endings = self.take_endings(lineno, &parsed);
         let mut bars = Vec::with_capacity(n_bars);
         let mut start = 0usize;
         for (b, &width) in widths.iter().enumerate() {
@@ -332,6 +365,7 @@ impl Parser {
                 start,
                 repeat_start: parsed.iter().any(|line| line[b].repeat_start),
                 close: parsed[0][b].close,
+                ending: endings[b],
                 voice_split,
                 split_changes,
                 strings,
@@ -501,12 +535,56 @@ impl Parser {
         slots
     }
 
+    /// Assign volta ending numbers to the system's bars from the pending
+    /// endings line. A `+N` marker starts ending N at the bar whose leading
+    /// barline it sits on; the ending runs to the next marker (or the end
+    /// of the system).
+    fn take_endings(&mut self, lineno: usize, parsed: &[Vec<ParsedBar>]) -> Vec<Option<usize>> {
+        let markers = std::mem::take(&mut self.pending_endings);
+        let n_bars = parsed[0].len();
+        if markers.is_empty() {
+            return vec![None; n_bars];
+        }
+        let mut starts: Vec<(usize, usize)> = Vec::new();
+        let mut seen = HashSet::new();
+        for &(col, num) in &markers {
+            match (0..n_bars).find(|&b| parsed[0][b].marker_col == col) {
+                Some(bar) if seen.insert(num) => starts.push((bar, num)),
+                Some(_) => self.warn(lineno, format!("duplicate volta ending {num}; ignored")),
+                None => self.warn(
+                    lineno,
+                    format!(
+                        "volta ending marker at column {} is not aligned with a barline; ignored",
+                        col + 1
+                    ),
+                ),
+            }
+        }
+        starts.sort_unstable_by_key(|&(bar, _)| bar);
+        let mut endings = vec![None; n_bars];
+        let mut current = None;
+        let mut next = 0usize;
+        for (bar, ending) in endings.iter_mut().enumerate() {
+            while next < starts.len() && starts[next].0 == bar {
+                current = Some(starts[next].1);
+                next += 1;
+            }
+            *ending = current;
+        }
+        endings
+    }
+
     fn finish(mut self) -> Result<Tab, String> {
         self.flush_system();
         if !self.pending_chords.is_empty() {
             self.tab
                 .warnings
                 .push("chord symbols without a following tab system; ignored".to_string());
+        }
+        if !self.pending_endings.is_empty() {
+            self.tab
+                .warnings
+                .push("volta endings without a following tab system; ignored".to_string());
         }
         if self.tab.systems.is_empty() {
             return Err("no tab systems found in input".to_string());
@@ -528,6 +606,39 @@ fn is_separator(line: &str) -> bool {
 /// A tab line starts with a barline or voice marker in column one.
 fn is_tab_line(line: &str) -> bool {
     line.starts_with('|') || line.starts_with('!')
+}
+
+/// A volta endings line: `+` markers with optional ending numbers, e.g.
+/// `+1-------+2----+`. Returns the 0-based column and number of each
+/// numbered marker, or `None` if the line contains a character that does
+/// not belong on one.
+fn parse_endings_line(line: &str) -> Option<Vec<(usize, usize)>> {
+    let chars: Vec<char> = line.chars().collect();
+    let mut markers = Vec::new();
+    let mut i = 0usize;
+    while i < chars.len() {
+        match chars[i] {
+            '+' => {
+                let col = i;
+                i += 1;
+                let mut num = 0usize;
+                let mut digits = 0usize;
+                while i < chars.len() && chars[i].is_ascii_digit() {
+                    num = num
+                        .saturating_mul(10)
+                        .saturating_add((chars[i] as u8 - b'0') as usize);
+                    digits += 1;
+                    i += 1;
+                }
+                if digits > 0 && num > 0 {
+                    markers.push((col, num));
+                }
+            }
+            '-' | ' ' | '\t' => i += 1,
+            _ => return None,
+        }
+    }
+    Some(markers)
 }
 
 /// A `key: value` metadata line.
@@ -683,10 +794,10 @@ fn read_barline(chars: &[char], i: usize) -> (Barline, char, bool, usize) {
 fn parse_tab_line(line: &str) -> Option<Vec<ParsedBar>> {
     let chars: Vec<char> = line.chars().collect();
     // The leading barline: `|`, `!` or `|:`.
-    let (mut marker, mut repeat_start, mut i) = match chars.first()? {
-        '!' => ('!', false, 1),
-        '|' if chars.get(1) == Some(&':') => ('|', true, 2),
-        '|' => ('|', false, 1),
+    let (mut marker, mut marker_col, mut repeat_start, mut i) = match chars.first()? {
+        '!' => ('!', 0, false, 1),
+        '|' if chars.get(1) == Some(&':') => ('|', 0, true, 2),
+        '|' => ('|', 0, false, 1),
         _ => return None,
     };
     let mut bars = Vec::new();
@@ -703,6 +814,7 @@ fn parse_tab_line(line: &str) -> Option<Vec<ParsedBar>> {
                 let (close, next_marker, next_repeat, len) = read_barline(&chars, i);
                 bars.push(ParsedBar {
                     marker,
+                    marker_col,
                     repeat_start,
                     content: std::mem::take(&mut content),
                     close,
@@ -717,6 +829,14 @@ fn parse_tab_line(line: &str) -> Option<Vec<ParsedBar>> {
                     return Some(bars);
                 }
                 marker = next_marker;
+                // A `!` marker is its own character; a `|` marker shares the
+                // last character of the closing barline token — except a
+                // `|:`, whose `|` is the token's first character.
+                marker_col = match next_marker {
+                    '!' => i,
+                    _ if next_repeat => i,
+                    _ => i - 1,
+                };
                 repeat_start = next_repeat;
             }
             Some(&c) => {
@@ -922,6 +1042,16 @@ F#  C#7 # the verse
         // the last system closes.
         assert!(tab.systems[0].bars[1].repeat_start);
         assert_eq!(tab.systems[4].bars[0].close, Barline::RepeatEnd);
+        // The endings line above the last system marks its two bars as the
+        // first and second volta endings; no other bar belongs to one.
+        assert_eq!(tab.systems[4].bars[0].ending, Some(1));
+        assert_eq!(tab.systems[4].bars[1].ending, Some(2));
+        assert!(
+            tab.systems
+                .iter()
+                .take(4)
+                .all(|s| s.bars.iter().all(|bar| bar.ending.is_none()))
+        );
         // Bar 15 ends with the double digit fret 10, which starts at the
         // first digit and sounds until the barline.
         assert_eq!(
@@ -959,6 +1089,112 @@ F#  C#7 # the verse
                 },
             ]
         );
+    }
+
+    #[test]
+    fn volta_endings() {
+        // A `+N` marker on an endings line starts ending N at the bar whose
+        // barline it sits on; the ending runs to the next marker (or the
+        // end of the system). The first ending's bar carries the `:|`.
+        let tab = parse(
+            "\
+{signature:4/4}
+|:0-------0-------|0-------0-------|
+|:----------------|----------------|
+|:----------------|----------------|
+|:----------------|----------------|
+|:----------------|----------------|
+|:----------------|----------------|
+
++1----------------+2---------------+
+|0-------0-------:|0-------0-------||
+|----------------:|----------------||
+|----------------:|----------------||
+|----------------:|----------------||
+|----------------:|----------------||
+|----------------:|----------------||
+",
+        )
+        .unwrap();
+        assert!(tab.warnings.is_empty(), "warnings: {:?}", tab.warnings);
+        assert_eq!(tab.systems.len(), 2);
+        assert!(tab.systems[0].bars.iter().all(|bar| bar.ending.is_none()));
+        assert_eq!(tab.systems[1].bars[0].ending, Some(1));
+        assert_eq!(tab.systems[1].bars[1].ending, Some(2));
+        assert_eq!(tab.systems[1].bars[0].close, Barline::RepeatEnd);
+        assert_eq!(tab.systems[1].bars[1].close, Barline::Double);
+    }
+
+    #[test]
+    fn volta_endings_mid_system() {
+        // The endings may start at a later bar of the system, so the
+        // endings line need not begin with a numbered marker.
+        let tab = parse(
+            "\
+--------+1------+2-----+
+|:0-----|1-----:|2-----||
+|:------|------:|------||
+|:------|------:|------||
+|:------|------:|------||
+|:------|------:|------||
+|:------|------:|------||
+",
+        )
+        .unwrap();
+        assert!(tab.warnings.is_empty(), "warnings: {:?}", tab.warnings);
+        assert_eq!(tab.systems[0].bars[0].ending, None);
+        assert_eq!(tab.systems[0].bars[1].ending, Some(1));
+        assert_eq!(tab.systems[0].bars[2].ending, Some(2));
+    }
+
+    #[test]
+    fn volta_endings_warnings() {
+        // A marker must sit on a barline of the system below, and each
+        // ending number may start only once.
+        let misaligned = parse(
+            "\
+--------+1-------+2-----+
+|:0-----|1-----:|2-----||
+|:------|------:|------||
+|:------|------:|------||
+|:------|------:|------||
+|:------|------:|------||
+|:------|------:|------||
+",
+        )
+        .unwrap();
+        assert_eq!(
+            misaligned.warnings.len(),
+            1,
+            "warnings: {:?}",
+            misaligned.warnings
+        );
+        assert!(misaligned.warnings[0].contains("not aligned with a barline"));
+        // The dropped marker leaves the rest of the system in ending 1.
+        assert_eq!(misaligned.systems[0].bars[1].ending, Some(1));
+        assert_eq!(misaligned.systems[0].bars[2].ending, Some(1));
+
+        let duplicate = parse(
+            "\
+--------+1------+1-----+
+|:0-----|1-----:|2-----||
+|:------|------:|------||
+|:------|------:|------||
+|:------|------:|------||
+|:------|------:|------||
+|:------|------:|------||
+",
+        )
+        .unwrap();
+        assert_eq!(
+            duplicate.warnings.len(),
+            1,
+            "warnings: {:?}",
+            duplicate.warnings
+        );
+        assert!(duplicate.warnings[0].contains("duplicate volta ending 1"));
+        assert_eq!(duplicate.systems[0].bars[1].ending, Some(1));
+        assert_eq!(duplicate.systems[0].bars[2].ending, Some(1));
     }
 
     #[test]
@@ -1003,9 +1239,9 @@ F#  C#7 # the verse
 
     #[test]
     fn readme_md_itself_parses() {
-        // All eight fenced examples inside README.md should be found.
+        // The nine fenced examples inside README.md should all be found.
         let tab = parse(include_str!("../README.md")).unwrap();
-        assert_eq!(tab.systems.len(), 8);
+        assert_eq!(tab.systems.len(), 9);
         // The first example shows the same music in bars of four different
         // widths.
         assert_eq!(tab.systems[0].bars.len(), 4);
@@ -1103,6 +1339,21 @@ F#  C#7 # the verse
         assert!(tab.systems[7].bars[0].repeat_start);
         assert_eq!(tab.systems[7].bars[1].close, Barline::RepeatEnd);
         assert_eq!(tab.systems[7].bars[0].voice_split, Some(5));
+        // The ninth example repeats with two alternative endings that
+        // share their system with the body: the indented endings line
+        // marks the third bar (volta 1, closed by `:|`) and the last two
+        // bars (volta 2, the last only four columns wide).
+        assert_eq!(tab.systems[8].bars.len(), 5);
+        let widths: Vec<usize> = tab.systems[8].bars.iter().map(|b| b.width).collect();
+        assert_eq!(widths, vec![16, 16, 16, 16, 4]);
+        assert!(tab.systems[8].bars[0].repeat_start);
+        assert_eq!(tab.systems[8].bars[0].ending, None);
+        assert_eq!(tab.systems[8].bars[1].ending, None);
+        assert_eq!(tab.systems[8].bars[2].ending, Some(1));
+        assert_eq!(tab.systems[8].bars[2].close, Barline::RepeatEnd);
+        assert_eq!(tab.systems[8].bars[3].ending, Some(2));
+        assert_eq!(tab.systems[8].bars[4].ending, Some(2));
+        assert_eq!(tab.systems[8].bars[4].close, Barline::Single);
     }
 
     #[test]

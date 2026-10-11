@@ -58,8 +58,6 @@ systems, and no separator is needed between the header and the music. The
 recognised keys are `title`, `composer`, `arranger`, `key`, `signature`
 (shorthand `s`), `tempo` (beats per minute) and `tuning`.
 
-
-
 Voices
 ------
 
@@ -159,6 +157,33 @@ beginning). The section is engraved as a volta repeat and played twice:
 |:----------------|----------------:|
 |:----------------|----------------:|
 ~~~
+
+Alternative endings
+-------------------
+
+A line made of `+` markers above a system marks alternative endings for a
+repeat. Each `+` sits on a barline of the system below; a number after it
+starts that ending, which runs to the next `+` (or the end of the line).
+The first ending's last bar carries the `:|` that sends the player back to
+the start of the repeat, and the later endings are played on the repeat
+passes:
+
+~~~tab
+{signature:4/4}
+                                   +1----------------+2---------------+
+|:0-------0-------|0-------0-------|0-------0-------:|0-------0-------|0---|
+|:----------------|----------------|----------------:|----------------|----|
+|:----------------|----------------|----------------:|----------------|----|
+|:----------------|----------------|----------------:|----------------|----|
+|:----------------|----------------|----------------:|----------------|----|
+|:----------------|----------------|----------------:|----------------|----|
+~~~
+
+The first time through, the music after the `|:` is played and then the
+first ending; the `:|` jumps back to the `|:` and the second ending
+replaces the first on the second pass. The endings do not need a system
+of their own: they may follow the body bars in the same system, and the
+endings line may be indented to bring each `+` onto the barline it marks.
 
  
 ## Usage
