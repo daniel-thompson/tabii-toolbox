@@ -51,6 +51,9 @@ pub fn generate(tab: &Tab) -> (String, Vec<String>) {
     let mut warnings = Vec::new();
     let mut out = String::new();
     out.push_str(&format!("\\version \"{LILYPOND_VERSION}\"\n\n"));
+    out.push_str(
+        "\\paper {\n  #(set-paper-size \"a4\")\n  left-margin = 20\n  line-width = 180\n  indent = #0\n}\n\n",
+    );
 
     let mut header: Vec<(&str, &String)> = Vec::new();
     if let Some(title) = &tab.title {
@@ -62,13 +65,14 @@ pub fn generate(tab: &Tab) -> (String, Vec<String>) {
     if let Some(arranger) = &tab.arranger {
         header.push(("arranger", arranger));
     }
-    if !header.is_empty() {
-        out.push_str("\\header {\n");
-        for (field, value) in header {
-            out.push_str(&format!("  {field} = {}\n", quote(value)));
-        }
-        out.push_str("}\n\n");
+    // The tagline is a header field, so the header block is always
+    // emitted, even when the tab has no metadata.
+    out.push_str("\\header {\n");
+    for (field, value) in header {
+        out.push_str(&format!("  {field} = {}\n", quote(value)));
     }
+    out.push_str("  tagline = ##f\n");
+    out.push_str("}\n\n");
 
     let has_chords = tab.systems.iter().any(|system| !system.chords.is_empty());
     let key_map = tab.key.map(|key| key_spelling_map(key.fifths()));
@@ -96,7 +100,9 @@ pub fn generate(tab: &Tab) -> (String, Vec<String>) {
     }
     out.push_str("    >>\n");
     out.push_str("  >>\n");
-    out.push_str("  \\layout { }\n");
+    // The last system is spaced naturally instead of being stretched to
+    // the full page width.
+    out.push_str("  \\layout {\n    ragged-last = ##t\n  }\n");
     out.push_str("}\n");
     (out, warnings)
 }
@@ -1007,6 +1013,16 @@ mod tests {
         assert!(lilypond.contains("fis,8 a,8 b,4 cis2 |"));
         assert!(lilypond.contains("\\new StaffGroup <<"));
         assert!(lilypond.contains("\\new TabStaff <<"));
+        // The score is laid out for A4 paper with a 20 mm left margin, a
+        // 180 mm line width and no first-system indent, and the last
+        // system is not stretched to the full page width.
+        assert!(lilypond.contains(
+            "\\paper {\n  #(set-paper-size \"a4\")\n  left-margin = 20\n  line-width = 180\n  indent = #0\n}"
+        ));
+        // The tagline is a header field, so the header block is always
+        // emitted, even without any metadata.
+        assert!(lilypond.contains("\\header {\n  tagline = ##f\n}"));
+        assert!(lilypond.contains("\\layout {\n    ragged-last = ##t\n  }"));
         assert!(lilypond.contains("\\new TabVoice = \"upper\""));
         assert!(lilypond.contains("\\new TabVoice = \"lower\""));
         // The tab staff repeats the music with a string number on every note,
