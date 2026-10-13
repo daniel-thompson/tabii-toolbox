@@ -1,7 +1,11 @@
-tab2lilypond
-============
+tabii toolbox
+=============
 
-tab2lilypond is a tool that converts guitar tab to lilypond notation. The
+<p align="center">
+  <img src="images/tabii.png" alt="tabii, the tabby cat mascot">
+</p>
+
+tabii is a tool that converts guitar tab to lilypond notation. The
 guitar tab syntax is a close to "natural" ASCII tab as possible and it's
 possible to play directly from the ASCII source. However the syntax is
 enriched with subtle additional symbols that mark things like separate
@@ -221,7 +225,7 @@ replaces the first on the second pass. The endings do not need a system
 of their own: they may follow the body bars in the same system, and the
 endings line may be indented to bring each `+` onto the barline it marks.
 
- 
+
 ## Usage
 
 The tab is read from the file given on the command line (or standard input
