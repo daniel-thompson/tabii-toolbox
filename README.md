@@ -226,11 +226,17 @@ endings line may be indented to bring each `+` onto the barline it marks.
 
 The tab is read from the file given on the command line (or standard input
 when no file is given) and the LilyPond source is written to standard
-output.  The score contains a conventional staff (in the octave-transposing
-treble clef) above a tablature staff; every note in the tab staff carries a
-string number, so the frets shown are exactly the ones in the tab rather
-than a fingering guessed by LilyPond.  Warnings about ignored or unsupported
-input go to standard error:
+output.  Each voice's music is defined once in a top level variable
+(`VoiceOne`, plus `VoiceTwo` when the tab separates voices) and both staves
+play it: a conventional staff (in the octave-transposing treble clef) above
+a tablature staff.  Every note carries its string number, so the frets
+shown in the tablature staff are exactly the ones in the tab rather than a
+fingering guessed by LilyPond.  Only the few staff-specific settings are
+tagged: `tab` marks the arpeggio marks and the tab staff's arpeggio
+setting, and `staff` marks the tempo and the `\omit StringNumber` that
+hides the string numbers on the conventional staff; each staff strips the
+tags it does not want with `\removeWithTag`.  Warnings about ignored or
+unsupported input go to standard error:
 
     cargo run -- examples/aura_lee.tab > aura_lee.ly
     lilypond aura_lee.ly

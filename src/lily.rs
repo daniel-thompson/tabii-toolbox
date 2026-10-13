@@ -78,6 +78,49 @@ pub fn generate(tab: &Tab) -> (String, Vec<String>) {
     let key_map = tab.key.map(|key| key_spelling_map(key.fifths()));
     let volta = volta_marks(tab, &mut warnings);
 
+    // Each voice's music is defined once in a top level variable and shared
+    // by both staves.  The tab-only string numbers and arpeggios carry the
+    // `tab` tag and the tempo mark the `staff` tag, so each staff strips
+    // what it does not want with \removeWithTag.
+    let two_voice = tab.systems.iter().any(|system| {
+        system
+            .bars
+            .iter()
+            .any(|bar| bar.voice_split.is_some() || !bar.split_changes.is_empty())
+    });
+    let voices: Vec<(&str, Voice)> = if two_voice {
+        vec![("VoiceOne", Voice::Upper), ("VoiceTwo", Voice::Lower)]
+    } else {
+        vec![("VoiceOne", Voice::Single)]
+    };
+    for (name, voice) in &voices {
+        let mut state = VoiceState::new();
+        let piece = Piece {
+            tab,
+            voice: *voice,
+            key_map: key_map.as_ref(),
+            volta: &volta,
+        };
+        let lines = render_voice_piece(&piece, &mut state, &mut warnings);
+        out.push_str(&format!("{name} = {{\n"));
+        // Tab staves suppress arpeggios by default; the override is tagged
+        // so only the tablature staff keeps it.
+        out.push_str("  \\tag #'tab { \\override Arpeggio.stencil = #ly:arpeggio::print }\n");
+        // The string numbers that pin the tablature staff's frets would
+        // print as circled numbers on the conventional staff; one tagged
+        // omit hides them there, and the tablature staff strips it.
+        out.push_str("  \\tag #'staff { \\omit StringNumber }\n");
+        match voice {
+            Voice::Upper => out.push_str("  \\voiceOne\n"),
+            Voice::Lower => out.push_str("  \\voiceTwo\n"),
+            Voice::Single => {}
+        }
+        for line in lines {
+            out.push_str(&format!("  {line}\n"));
+        }
+        out.push_str("}\n\n");
+    }
+
     out.push_str("\\score {\n");
     out.push_str("  <<\n");
     if has_chords {
@@ -88,15 +131,21 @@ pub fn generate(tab: &Tab) -> (String, Vec<String>) {
         out.push_str("    }\n");
     }
     out.push_str("    \\new StaffGroup <<\n");
-    for tab_mode in [false, true] {
-        write_staff(
-            &mut out,
-            tab,
-            key_map.as_ref(),
-            &mut warnings,
-            tab_mode,
-            &volta,
+    if two_voice {
+        out.push_str("      \\new Staff <<\n");
+        out.push_str("        \\clef \"treble_8\"\n");
+        out.push_str("        \\new Voice = \"upper\" { \\removeWithTag #'tab \\VoiceOne }\n");
+        out.push_str("        \\new Voice = \"lower\" { \\removeWithTag #'tab \\VoiceTwo }\n");
+        out.push_str("      >>\n");
+        out.push_str("      \\new TabStaff <<\n");
+        out.push_str("        \\new TabVoice = \"upper\" { \\removeWithTag #'staff \\VoiceOne }\n");
+        out.push_str("        \\new TabVoice = \"lower\" { \\removeWithTag #'staff \\VoiceTwo }\n");
+        out.push_str("      >>\n");
+    } else {
+        out.push_str(
+            "      \\new Staff {\n        \\clef \"treble_8\"\n        \\removeWithTag #'tab \\VoiceOne\n      }\n",
         );
+        out.push_str("      \\new TabStaff { \\removeWithTag #'staff \\VoiceOne }\n");
     }
     out.push_str("    >>\n");
     out.push_str("  >>\n");
@@ -186,88 +235,6 @@ pub(crate) fn volta_marks(tab: &Tab, warnings: &mut Vec<String>) -> Vec<VoltaBar
     marks
 }
 
-/// Write one staff of the score: the conventional `Staff` when `tab_mode` is
-/// false, the matching `TabStaff` when true. The tab staff repeats the same
-/// music with a string number attached to every note, so LilyPond computes
-/// each fret from the string the tab actually uses instead of guessing a
-/// first-position fingering (`minimumFret` only steers that guesswork, and
-/// the automatic selector may put two chord notes on one string).
-fn write_staff(
-    out: &mut String,
-    tab: &Tab,
-    key_map: Option<&SpellingMap>,
-    warnings: &mut Vec<String>,
-    tab_mode: bool,
-    volta: &[VoltaBar],
-) {
-    let two_voice = tab.systems.iter().any(|system| {
-        system
-            .bars
-            .iter()
-            .any(|bar| bar.voice_split.is_some() || !bar.split_changes.is_empty())
-    });
-    let (staff, voice_ctx) = if tab_mode {
-        ("TabStaff", "TabVoice")
-    } else {
-        ("Staff", "Voice")
-    };
-    // The tab staff renders the same events, so any warnings it raises have
-    // already been reported by the conventional staff.
-    let mut scratch = Vec::new();
-    let warn: &mut Vec<String> = if tab_mode { &mut scratch } else { warnings };
-    if two_voice {
-        out.push_str(&format!("      \\new {staff} <<\n"));
-        if !tab_mode {
-            out.push_str("        \\clef \"treble_8\"\n");
-        }
-        for (name, voice, command) in [
-            ("upper", Voice::Upper, "\\voiceOne"),
-            ("lower", Voice::Lower, "\\voiceTwo"),
-        ] {
-            out.push_str(&format!("        \\new {voice_ctx} = \"{name}\" {{\n"));
-            if tab_mode {
-                // Tab staves suppress arpeggios by default.
-                out.push_str("          \\override Arpeggio.stencil = #ly:arpeggio::print\n");
-            }
-            out.push_str(&format!("          {command}\n"));
-            let mut state = VoiceState::new();
-            let piece = Piece {
-                tab,
-                voice,
-                key_map,
-                tab_mode,
-                volta,
-            };
-            let lines = render_voice_piece(&piece, &mut state, warn);
-            for line in lines {
-                out.push_str(&format!("          {line}\n"));
-            }
-            out.push_str("        }\n");
-        }
-        out.push_str("      >>\n");
-    } else {
-        out.push_str(&format!("      \\new {staff} {{\n"));
-        if !tab_mode {
-            out.push_str("        \\clef \"treble_8\"\n");
-        } else {
-            out.push_str("        \\override Arpeggio.stencil = #ly:arpeggio::print\n");
-        }
-        let mut state = VoiceState::new();
-        let piece = Piece {
-            tab,
-            voice: Voice::Single,
-            key_map,
-            tab_mode,
-            volta,
-        };
-        let lines = render_voice_piece(&piece, &mut state, warn);
-        for line in lines {
-            out.push_str(&format!("          {line}\n"));
-        }
-        out.push_str("      }\n");
-    }
-}
-
 fn quote(value: &str) -> String {
     format!("\"{}\"", value.replace('\\', "\\\\").replace('"', "\\\""))
 }
@@ -312,7 +279,6 @@ struct Piece<'a> {
     tab: &'a Tab,
     voice: Voice,
     key_map: Option<&'a SpellingMap>,
-    tab_mode: bool,
     /// One entry per bar of the whole tab.
     volta: &'a [VoltaBar],
 }
@@ -323,12 +289,12 @@ fn render_voice_piece(
     warnings: &mut Vec<String>,
 ) -> Vec<String> {
     let mut lines = Vec::new();
-    // The tempo mark is printed once, above the conventional staff.
+    // The tempo mark is printed once, above the conventional staff; the
+    // tablature staff strips it with \removeWithTag.
     if piece.voice != Voice::Lower
-        && !piece.tab_mode
         && let Some(tempo) = piece.tab.tempo
     {
-        lines.push(format!("\\tempo 4 = {tempo}"));
+        lines.push(format!("\\tag #'staff {{ \\tempo 4 = {tempo} }}"));
     }
     if piece.voice != Voice::Lower
         && let Some(key) = piece.tab.key
@@ -368,7 +334,6 @@ fn render_voice_system(
     let tab = piece.tab;
     let voice = piece.voice;
     let key_map = piece.key_map;
-    let tab_mode = piece.tab_mode;
     let last_system = tab.systems.len() - 1;
     let n_bars = system.bars.len();
     // Each bar may have its own width, so the time value of one column and
@@ -472,7 +437,7 @@ fn render_voice_system(
         // of the active chord, falling back to the key. An arpeggio mark is
         // engraved in the tablature staff only.
         let mut notes: Vec<(usize, i32, String)> = tied;
-        let arpeggio = tab_mode && event.onsets.iter().any(|&(_, _, arp)| arp);
+        let arpeggio = event.onsets.iter().any(|&(_, _, arp)| arp);
         for &(string, fret, _) in &event.onsets {
             let midi = tab.tuning.open_midi[string] + fret as i32;
             let chord_map = active_chord(
@@ -499,7 +464,7 @@ fn render_voice_system(
                 ),
             );
         } else {
-            let (pitch_text, string_suffix) = chord_text(&notes, tab_mode);
+            let (pitch_text, string_suffix) = chord_text(&notes);
             let durs = note_durs(
                 col_of(event.abs, &system.bars[event.bar]),
                 event.duration,
@@ -514,7 +479,7 @@ fn render_voice_system(
                 // The arpeggio marks the attack, so only the first of a
                 // chain of tied notes carries it.
                 if arpeggio && i == 0 {
-                    token.push_str("\\arpeggio");
+                    token.push_str("\\tag #'tab \\arpeggio");
                 }
                 tuplets.push(&mut tokens, *dur, token);
             }
@@ -792,26 +757,21 @@ impl TupletGroups {
 /// Pitch text for one note event, plus a suffix to place after the duration.
 /// LilyPond wants `c4\5` for single notes (duration before the string number)
 /// but `<c\5 e\4 g\3>1` for chords (string numbers inside, duration outside).
-fn chord_text(notes: &[(usize, i32, String)], with_strings: bool) -> (String, String) {
+/// Every note carries its string number so the tablature staff derives each
+/// fret from the string the tab actually uses instead of guessing a
+/// first-position fingering (`minimumFret` only steers that guesswork, and
+/// the automatic selector may put two chord notes on one string).  The
+/// numbers are not tagged individually: the conventional staff hides them
+/// with the variable's single tagged `\omit StringNumber`.
+fn chord_text(notes: &[(usize, i32, String)]) -> (String, String) {
     if notes.len() == 1 {
         let &(string, _, ref name) = &notes[0];
         // String 1 is the highest string, which is index 0 in the tuning.
-        let suffix = if with_strings {
-            format!("\\{}", string + 1)
-        } else {
-            String::new()
-        };
-        (name.clone(), suffix)
+        (name.clone(), format!("\\{}", string + 1))
     } else {
         let names: Vec<String> = notes
             .iter()
-            .map(|&(string, _, ref name)| {
-                if with_strings {
-                    format!("{name}\\{}", string + 1)
-                } else {
-                    name.clone()
-                }
-            })
+            .map(|&(string, _, ref name)| format!("{name}\\{}", string + 1))
             .collect();
         (format!("<{}>", names.join(" ")), String::new())
     }
@@ -1002,15 +962,31 @@ mod tests {
         let (lilypond, warnings) = generate(&tab);
         assert!(warnings.is_empty(), "warnings: {warnings:?}");
         assert!(lilypond.contains("\\version \"2.24.0\""));
+        // The music is defined once in top level variables shared by both
+        // staves; each staff strips the tags it does not want.
+        assert!(lilypond.contains("VoiceOne = {"));
+        assert!(lilypond.contains("VoiceTwo = {"));
         assert!(lilypond.contains("\\new Staff <<"));
         assert!(lilypond.contains("\\clef \"treble_8\""));
         assert!(lilypond.contains("\\voiceOne"));
         assert!(lilypond.contains("\\voiceTwo"));
         assert!(lilypond.contains("\\time 4/4"));
+        assert!(lilypond.contains("\\new Voice = \"upper\" { \\removeWithTag #'tab \\VoiceOne }"));
+        assert!(
+            lilypond.contains("\\new TabVoice = \"lower\" { \\removeWithTag #'staff \\VoiceTwo }")
+        );
         // Treble: a quaver, three pairs of tied quavers and a final quaver.
-        assert!(lilypond.contains("fis8 a8~ a8 dis'8~ dis'8 fis'8~ fis'8 a'8 |"));
+        // Every note carries its string number, so the tablature staff
+        // derives the frets the tab specifies instead of guessing a
+        // first-position fingering; the conventional staff hides the
+        // numbers with the variable's tagged \omit StringNumber.
+        assert!(
+            lilypond
+                .contains("fis8\\4 a8\\3~ a8\\3 dis'8\\2~ dis'8\\2 fis'8\\1~ fis'8\\1 a'8\\1 |",)
+        );
         // Bass: two quavers, a crotchet and a minim.
-        assert!(lilypond.contains("fis,8 a,8 b,4 cis2 |"));
+        assert!(lilypond.contains("fis,8\\6 a,8\\6 b,4\\5 cis2\\5 |"));
+        assert!(lilypond.contains("\\tag #'staff { \\omit StringNumber }"));
         assert!(lilypond.contains("\\new StaffGroup <<"));
         assert!(lilypond.contains("\\new TabStaff <<"));
         // The score is laid out for A4 paper with a 20 mm left margin, a
@@ -1023,16 +999,6 @@ mod tests {
         // emitted, even without any metadata.
         assert!(lilypond.contains("\\header {\n  tagline = ##f\n}"));
         assert!(lilypond.contains("\\layout {\n    ragged-last = ##t\n  }"));
-        assert!(lilypond.contains("\\new TabVoice = \"upper\""));
-        assert!(lilypond.contains("\\new TabVoice = \"lower\""));
-        // The tab staff repeats the music with a string number on every note,
-        // so LilyPond derives the frets the tab specifies instead of guessing
-        // a first-position fingering.
-        assert!(
-            lilypond
-                .contains("fis8\\4 a8\\3~ a8\\3 dis'8\\2~ dis'8\\2 fis'8\\1~ fis'8\\1 a'8\\1 |")
-        );
-        assert!(lilypond.contains("fis,8\\6 a,8\\6 b,4\\5 cis2\\5 |"));
     }
 
     #[test]
@@ -1051,12 +1017,14 @@ mod tests {
         .unwrap();
         let (lilypond, warnings) = generate(&tab);
         assert!(warnings.is_empty(), "warnings: {warnings:?}");
-        // Without a voice split both staves take their music directly.
+        // Without a voice split one variable holds the music and both staves
+        // take it directly.
         assert!(lilypond.contains("\\new Staff {"));
         assert!(lilypond.contains("\\new TabStaff {"));
         assert!(!lilypond.contains("\\new Voice"));
         assert!(!lilypond.contains("\\new TabVoice"));
-        assert!(lilypond.contains("<g, e'>2 a'2 |"));
+        assert!(lilypond.contains("\\removeWithTag #'tab \\VoiceOne"));
+        assert!(lilypond.contains("\\new TabStaff { \\removeWithTag #'staff \\VoiceOne }"));
         assert!(lilypond.contains("<g,\\6 e'\\1>2 a'2\\1 |"));
     }
 
@@ -1080,59 +1048,50 @@ mod tests {
         assert!(lilypond.contains("c2 a2:7 |"));
         assert!(lilypond.contains("g1 |"));
         assert!(lilypond.contains("s1 |"));
+        // The music is defined once per voice; every note carries its string
+        // number, so the tablature staff derives the frets the tab specifies
+        // and the conventional staff hides the numbers with the tagged omit.
         // First bar: C major shape in the treble, Travis-picking bass.
-        assert!(lilypond.contains("<g c' e'>4 <g c' e'>4 <gis d' e'>2 |"));
-        assert!(lilypond.contains("c4 e4 e,4 e4 |"));
+        assert!(
+            lilypond.contains("<g\\3 c'\\2 e'\\1>4 <g\\3 c'\\2 e'\\1>4 <gis\\3 d'\\2 e'\\1>2 |")
+        );
+        assert!(lilypond.contains("c4\\5 e4\\4 e,4\\6 e4\\4 |"));
         // The tie over the barline at the end of the first system.
-        assert!(lilypond.contains("c'4 b4 a8 b8~ b8 c'8~ |"));
+        assert!(lilypond.contains("c'4\\2 b4\\2 a8\\3 b8\\2~ b8\\2 c'8\\2~ |"));
         // The first system is a repeated section: it opens with a volta at
         // the first bar and the `:|` closes it, so the barline itself is
-        // drawn by the repeat and every context wraps the same bars.
+        // drawn by the repeat and both voices wrap the same bars.
         assert!(lilypond.contains("\\repeat volta 2 { c2 a2:7 |"));
-        assert!(lilypond.contains("c'1 | \\break }"));
-        assert!(lilypond.contains("\\repeat volta 2 { g4 c'4 b8 c'8~ c'4 |"));
-        assert!(lilypond.contains("\\repeat volta 2 { c4 e4 c4 e4 |"));
+        assert!(lilypond.contains("c'1\\2 | \\break }"));
         assert!(lilypond.contains("\\repeat volta 2 { g4\\3 c'4\\2 b8\\2 c'8\\2~ c'4\\2 |"));
+        assert!(lilypond.contains("\\repeat volta 2 { c4\\5 e4\\4 c4\\5 e4\\4 |"));
         assert!(!lilypond.contains("\\bar \":|\""));
         // Bar 9 changes to A7 half way through, so the first-string F is
         // spelled F natural (the key's spelling) rather than E sharp; the
         // move to the chord's E natural then avoids an E sharp to E motion.
         assert!(
-            lilypond.contains("<g c' e'>4 <g c' e'>4 <g cis' f'>8~ <g cis' e'>8~ <g cis' e'>4 |")
+            lilypond
+                .contains("<g\\3 cis'\\2 f'\\1>8~ <g\\3 cis'\\2 e'\\1>8~ <g\\3 cis'\\2 e'\\1>4 |")
         );
         // The final bar is marked single voice (`!` on the bottom string):
         // the whole C major chord sounds in the treble while the bass is
         // filled with an invisible rest.
-        assert!(lilypond.contains("<c e g c'>1 | \\bar \"||\""));
-        assert!(lilypond.contains("s1 |"));
+        assert!(lilypond.contains("<c\\5 e\\4 g\\3 c'\\2>1\\tag #'tab \\arpeggio | \\bar \"||\""));
         // The third bar of the last system has no marker, so it keeps the
         // split of the bar before it.
-        assert!(lilypond.contains("c'4 b4 a8 b8~ b4 |"));
-        assert!(lilypond.contains("g,4 d4 g,4 d4 |"));
-        assert!(lilypond.contains("\\new TabStaff <<"));
-        // The tab staff pins every note to the string the tab uses, so the
-        // frets LilyPond derives match the tab exactly.
-        assert!(lilypond.contains("g4\\3 c'4\\2 b8\\2 c'8\\2~ c'4\\2 |"));
-        assert!(
-            lilypond.contains("<g\\3 c'\\2 e'\\1>4 <g\\3 c'\\2 e'\\1>4 <gis\\3 d'\\2 e'\\1>2 |")
-        );
-        assert!(lilypond.contains("c4\\5 e4\\4 e,4\\6 e4\\4 |"));
-        assert!(
-            lilypond
-                .contains("<g\\3 cis'\\2 f'\\1>8~ <g\\3 cis'\\2 e'\\1>8~ <g\\3 cis'\\2 e'\\1>4 |")
-        );
-        assert!(lilypond.contains("<c\\5 e\\4 g\\3 c'\\2>1\\arpeggio | \\bar \"||\""));
         assert!(lilypond.contains("c'4\\2 b4\\2 a8\\3 b8\\2~ b4\\2 |"));
         assert!(lilypond.contains("g,4\\6 d4\\4 g,4\\6 d4\\4 |"));
-        // Tab staves re-enable arpeggio printing.
-        assert!(lilypond.contains("\\override Arpeggio.stencil = #ly:arpeggio::print"));
+        assert!(lilypond.contains("\\new TabStaff <<"));
         // The `.` in the eighth column of the second system's third bar moves
         // the split to the third string: the G string joins the treble voice
         // from the next note on.
-        assert!(lilypond.contains("<c' e'>4 d'4 <g c'>8 d'8~ d'8 e'8~ |"));
-        assert!(lilypond.contains("f4 a4 g,4 d4 |"));
         assert!(lilypond.contains("<c'\\2 e'\\1>4 d'4\\2 <g\\3 c'\\2>8 d'8\\2~ d'8\\2 e'8\\1~ |"));
         assert!(lilypond.contains("f4\\4 a4\\3 g,4\\6 d4\\4 |"));
+        // Tab staves re-enable arpeggio printing; the override is tagged so
+        // only the tablature staff keeps it.
+        assert!(
+            lilypond.contains("\\tag #'tab { \\override Arpeggio.stencil = #ly:arpeggio::print }")
+        );
     }
 
     #[test]
@@ -1152,7 +1111,6 @@ mod tests {
         .unwrap();
         let (lilypond, warnings) = generate(&tab);
         assert!(warnings.is_empty(), "warnings: {warnings:?}");
-        assert!(lilypond.contains("a4 cis'4 f'4 ais'4 |"));
         assert!(lilypond.contains("a4\\5 cis'4\\4 f'4\\3 ais'4\\2 |"));
     }
 
@@ -1176,11 +1134,8 @@ mod tests {
         let (lilypond, warnings) = generate(&tab);
         assert!(warnings.is_empty(), "warnings: {warnings:?}");
         // Eight quavers in the first bar.
-        assert!(lilypond.contains("f,8 f,8 f,8 f,8 f,8 f,8 f,8 f,8 |"));
-        // Six triplet crotchets in the second bar, grouped in threes.
-        assert!(lilypond.contains("\\tuplet 3/2 { f,4 f,4 f,4 } \\tuplet 3/2 { f,4 f,4 f,4 } |"));
-        // The tablature staff repeats them with string numbers.
         assert!(lilypond.contains("f,8\\6 f,8\\6 f,8\\6 f,8\\6 f,8\\6 f,8\\6 f,8\\6 f,8\\6 |"));
+        // Six triplet crotchets in the second bar, grouped in threes.
         assert!(lilypond.contains(
             "\\tuplet 3/2 { f,4\\6 f,4\\6 f,4\\6 } \\tuplet 3/2 { f,4\\6 f,4\\6 f,4\\6 } |"
         ));
@@ -1208,16 +1163,13 @@ mod tests {
         let (lilypond, warnings) = generate(&tab);
         assert!(warnings.is_empty(), "warnings: {warnings:?}");
         // Bar 1: eight quavers in the bass under two minims in the treble.
-        assert!(lilypond.contains("a2 b2 |"));
-        assert!(lilypond.contains("f,8 c8 f8 c8 f,8 d8 g8 d8 |"));
+        assert!(lilypond.contains("a2\\3 b2\\2 |"));
+        assert!(lilypond.contains("f,8\\6 c8\\5 f8\\4 c8\\5 f,8\\6 d8\\4 g8\\3 d8\\4 |"));
         // Bar 2: four quavers then three triplet crotchets in both voices.
-        assert!(lilypond.contains("c'2 \\tuplet 3/2 { d'4 e'4 f'4 } |"));
-        assert!(lilypond.contains("e,8 e8 g8 e8 \\tuplet 3/2 { d4 g4 a4 } |"));
-        // Bar 3: a triplet minim and a triplet semibreve in the bass.
-        assert!(lilypond.contains("\\tuplet 3/2 { e,2 e,1 } |"));
-        // The tablature staff carries the same rhythm with string numbers.
         assert!(lilypond.contains("c'2\\2 \\tuplet 3/2 { d'4\\2 e'4\\1 f'4\\1 } |"));
         assert!(lilypond.contains("e,8\\6 e8\\4 g8\\3 e8\\4 \\tuplet 3/2 { d4\\4 g4\\3 a4\\3 } |"));
+        // Bar 3: a triplet minim and a triplet semibreve in the bass.
+        assert!(lilypond.contains("\\tuplet 3/2 { e,2\\6 e,1\\6 } |"));
     }
 
     #[test]
@@ -1226,26 +1178,26 @@ mod tests {
         let (lilypond, warnings) = generate(&tab);
         assert!(warnings.is_empty(), "warnings: {warnings:?}");
         assert!(lilypond.contains("\\tempo 4 = 110"));
+        // The tempo mark is tagged `staff`: the conventional staff keeps it
+        // and the tablature staff strips it, so it is printed only once.
+        assert!(lilypond.contains("\\tag #'staff { \\tempo 4 = 110 }"));
         // The `|:` before the second bar opens the repeated section that
-        // the `:|` in the last system closes; the staff and the tab staff
-        // repeat together (the file has no chord names).
-        assert_eq!(lilypond.matches("\\repeat volta 2 {").count(), 2);
+        // the `:|` in the last system closes; the single voice variable is
+        // shared by the staff and the tab staff, so both repeat together.
+        assert_eq!(lilypond.matches("\\repeat volta 2 {").count(), 1);
         // The endings line turns the last system's two bars into the two
         // alternatives of the repeat. The body's closing brace comes after
-        // the line break (a `\break` between the body and the alternative
+        // the line break (a `\\break` between the body and the alternative
         // would stop LilyPond associating them), volta 1 ends with the `:|`
         // that the repeat draws itself, and volta 2 closes into the final
         // double barline.
-        assert_eq!(lilypond.matches("\\alternative {").count(), 2);
-        assert_eq!(lilypond.matches("\\volta 1 {").count(), 2);
-        assert_eq!(lilypond.matches("\\volta 2 {").count(), 2);
-        assert!(lilypond.contains("a'4 g'4 | \\break }"));
-        assert!(lilypond.contains("\\alternative { \\volta 1 { <a, a'>2. g'4 | }"));
-        assert!(lilypond.contains("\\volta 2 { <a, a'>1 | } } \\bar \"||\""));
-        assert!(lilypond.contains("g'4\\1 | \\break }"));
+        assert_eq!(lilypond.matches("\\alternative {").count(), 1);
+        assert_eq!(lilypond.matches("\\volta 1 {").count(), 1);
+        assert_eq!(lilypond.matches("\\volta 2 {").count(), 1);
+        assert!(lilypond.contains("a'4\\1 g'4\\1 | \\break }"));
+        assert!(lilypond.contains("\\alternative { \\volta 1 { <a,\\5 a'\\1>2. g'4\\1 | }"));
         assert!(lilypond.contains("\\volta 2 { <a,\\5 a'\\1>1 | } } \\bar \"||\""));
         // Bar 15 ends with the double digit fret 10.
-        assert!(lilypond.contains("<d a c' f'>4 g'8 a'8 a,8 a'8 c''8 d''8 |"));
         assert!(
             lilypond
                 .contains("<d\\4 a\\3 c'\\2 f'\\1>4 g'8\\1 a'8\\1 a,8\\5 a'8\\1 c''8\\1 d''8\\1 |")
@@ -1273,8 +1225,8 @@ mod tests {
         assert_eq!(tab.systems[0].bars[1].close, Barline::RepeatEnd);
         let (lilypond, warnings) = generate(&tab);
         assert!(warnings.is_empty(), "warnings: {warnings:?}");
-        assert_eq!(lilypond.matches("\\repeat volta 2 { e'2 e'2 |").count(), 1);
-        assert_eq!(lilypond.matches("e'2 e'2 | }").count(), 1);
+        // The volta lives in the single shared voice variable, so both
+        // staves repeat together.
         assert_eq!(
             lilypond
                 .matches("\\repeat volta 2 { e'2\\1 e'2\\1 |")
@@ -1303,9 +1255,9 @@ mod tests {
         .unwrap();
         let (lilypond, warnings) = generate(&tab);
         assert!(warnings.is_empty(), "warnings: {warnings:?}");
-        // The volta appears in every voice stream: upper and lower on both
-        // the conventional staff and the tab staff.
-        assert_eq!(lilypond.matches("\\repeat volta 2 {").count(), 4);
+        // The volta appears once per voice variable, and both staves share
+        // each variable.
+        assert_eq!(lilypond.matches("\\repeat volta 2 {").count(), 2);
         assert!(lilypond.contains("\\new Voice = \"upper\""));
         assert!(lilypond.contains("\\new Voice = \"lower\""));
     }
@@ -1331,15 +1283,13 @@ mod tests {
         assert!(tab.warnings.is_empty(), "warnings: {:?}", tab.warnings);
         let (lilypond, warnings) = generate(&tab);
         assert!(warnings.is_empty(), "warnings: {warnings:?}");
-        assert_eq!(lilypond.matches("\\repeat volta 2 {").count(), 2);
-        assert_eq!(lilypond.matches("\\alternative {").count(), 2);
+        assert_eq!(lilypond.matches("\\repeat volta 2 {").count(), 1);
+        assert_eq!(lilypond.matches("\\alternative {").count(), 1);
         // The body ends mid-system, so its closing brace carries no line
         // break and the alternatives continue in the same system.
-        assert!(lilypond.contains("\\repeat volta 2 { e'2 e'2 |\n          e'2 e'2 | }"));
-        assert!(lilypond.contains("\\alternative { \\volta 1 { e'2 e'2 | }"));
-        assert!(lilypond.contains("\\volta 2 { e'2 e'2 |\n          e'1 | } }"));
+        assert!(lilypond.contains("\\repeat volta 2 { e'2\\1 e'2\\1 |\n  e'2\\1 e'2\\1 | }"));
         assert!(lilypond.contains("\\alternative { \\volta 1 { e'2\\1 e'2\\1 | }"));
-        assert!(lilypond.contains("\\volta 2 { e'2\\1 e'2\\1 |\n          e'1\\1 | } }"));
+        assert!(lilypond.contains("\\volta 2 { e'2\\1 e'2\\1 |\n  e'1\\1 | } }"));
         // The system ends with a plain barline and has no line breaks.
         assert!(!lilypond.contains("\\bar"));
         assert!(!lilypond.contains("\\break"));
@@ -1365,10 +1315,8 @@ mod tests {
         let (lilypond, warnings) = generate(&tab);
         assert!(warnings.is_empty(), "warnings: {warnings:?}");
         // Every bar holds the same four crotchet notes however wide it is.
-        let bar = "f4 a4 c'4 f'4 |";
+        let bar = "f4\\5 a4\\4 c'4\\3 f'4\\2 |";
         assert_eq!(lilypond.matches(bar).count(), 4);
-        let tab_bar = "f4\\5 a4\\4 c'4\\3 f'4\\2 |";
-        assert_eq!(lilypond.matches(tab_bar).count(), 4);
     }
 
     #[test]
@@ -1390,11 +1338,14 @@ mod tests {
         assert!(tab.warnings.is_empty(), "warnings: {:?}", tab.warnings);
         let (lilypond, warnings) = generate(&tab);
         assert!(warnings.is_empty(), "warnings: {warnings:?}");
-        // The chord starts on the first column (a whole note), and the
-        // arpeggio is engraved in the tablature staff only.
-        assert!(lilypond.contains("<a c' e'>1 |"));
-        assert!(lilypond.contains("<a\\3 c'\\2 e'\\1>1\\arpeggio |"));
-        assert!(lilypond.contains("\\override Arpeggio.stencil = #ly:arpeggio::print"));
+        // The chord starts on the first column (a whole note).  The arpeggio
+        // mark is tagged `tab`: the tablature staff engraves it (after
+        // re-enabling the arpeggio stencil) and the conventional staff
+        // strips it.
+        assert!(lilypond.contains("<a\\3 c'\\2 e'\\1>1\\tag #'tab \\arpeggio |"));
+        assert!(
+            lilypond.contains("\\tag #'tab { \\override Arpeggio.stencil = #ly:arpeggio::print }")
+        );
     }
 
     #[test]
@@ -1417,10 +1368,8 @@ mod tests {
         let (lilypond, warnings) = generate(&tab);
         assert!(warnings.is_empty(), "warnings: {warnings:?}");
         // Treble: the fourth-string F sharp only after the split change.
-        assert!(lilypond.contains("a8 b8~ b8 a8 fis8 a8 b8 cis'8 |"));
-        // Bass: alternating crotchets, the low E open and third fret.
-        assert!(lilypond.contains("e,4 e4 g,4 b,4 |"));
         assert!(lilypond.contains("a8\\3 b8\\3~ b8\\3 a8\\3 fis8\\4 a8\\3 b8\\3 cis'8\\2 |"));
+        // Bass: alternating crotchets, the low E open and third fret.
         assert!(lilypond.contains("e,4\\6 e4\\4 g,4\\6 b,4\\5 |"));
     }
 
@@ -1445,13 +1394,10 @@ mod tests {
         assert!(warnings.is_empty(), "warnings: {warnings:?}");
         assert!(lilypond.contains("\\time 4/4"));
         // First bar: alternating melody and bass.
-        assert!(lilypond.contains("e'8 c'8 g8 d'8 f'8 c'8 g8 d'8 |"));
-        assert!(lilypond.contains("c4 e4 c4 e4 |"));
+        assert!(lilypond.contains("e'8\\1 c'8\\2 g8\\3 d'8\\2 f'8\\1 c'8\\2 g8\\3 d'8\\2 |"));
+        assert!(lilypond.contains("c4\\5 e4\\4 c4\\5 e4\\4 |"));
         // Second bar keeps the split: the bass still has its own notes
         // instead of everything merging into one voice.
-        assert!(lilypond.contains("g'8 b8 d'8 f'8 g'8 d'8 b8 g8 |"));
-        assert!(lilypond.contains("g,4 d4 g,4 d4 |"));
-        assert!(lilypond.contains("e'8\\1 c'8\\2 g8\\3 d'8\\2 f'8\\1 c'8\\2 g8\\3 d'8\\2 |"));
         assert!(lilypond.contains("g'8\\1 b8\\2 d'8\\2 f'8\\1 g'8\\1 d'8\\2 b8\\2 g8\\3 |"));
         assert!(lilypond.contains("g,4\\6 d4\\4 g,4\\6 d4\\4 |"));
     }
@@ -1476,15 +1422,13 @@ mod tests {
         assert!(tab.warnings.is_empty(), "warnings: {:?}", tab.warnings);
         let (lilypond, warnings) = generate(&tab);
         assert!(warnings.is_empty(), "warnings: {warnings:?}");
-        assert!(lilypond.contains("c'4 b4 a8 b8~ b4 |"));
-        assert!(lilypond.contains("g,4 d4 g,4 d4 |"));
-        assert!(lilypond.contains("<c e g c'>1 |"));
+        assert!(lilypond.contains("c'4\\2 b4\\2 a8\\3 b8\\2~ b4\\2 |"));
+        assert!(lilypond.contains("g,4\\6 d4\\4 g,4\\6 d4\\4 |"));
+        assert!(lilypond.contains("<c\\5 e\\4 g\\3 c'\\2>1 |"));
         assert!(lilypond.contains("s1 |"));
         assert!(
             !lilypond.contains("r1"),
             "rests must be invisible: {lilypond}"
         );
-        assert!(lilypond.contains("c'4\\2 b4\\2 a8\\3 b8\\2~ b4\\2 |"));
-        assert!(lilypond.contains("<c\\5 e\\4 g\\3 c'\\2>1 |"));
     }
 }
